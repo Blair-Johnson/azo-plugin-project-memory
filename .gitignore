@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.pixi/
+.pytest_cache/
+pixi.lock
+.DS_Store
