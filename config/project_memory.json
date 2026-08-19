@@ -1,6 +1,0 @@
-{
-  "project_memory": {
-    "enabled": true,
-    "system_prompt": "Use project memories for durable project-specific facts, decisions, constraints, and procedures that should be recalled in future sessions. Call record_memory with concise standalone content and a selective regular expression that matches future transcript messages indicating relevance. Refine noisy memories with update_memory or temporarily quiet them with suppress_memory; delete obsolete memories. Do not record secrets, transient progress, or facts already maintained in authoritative project files."
-  }
-}

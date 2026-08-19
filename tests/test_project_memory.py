@@ -300,9 +300,9 @@ def test_system_prompt_wrapper_is_idempotent_and_model_only():
 
 
 def test_explicit_config_overrides_installed_config(tmp_path, monkeypatch):
-    config_path = tmp_path / "project_memory.json"
+    config_path = tmp_path / "project_memory.yaml"
     config_path.write_text(
-        '{"project_memory": {"enabled": false, "system_prompt": "installed"}}',
+        "project_memory:\n  enabled: false\n  system_prompt: installed\n",
         encoding="utf-8",
     )
     monkeypatch.setenv(pm.CONFIG_PATH_ENV, str(config_path))

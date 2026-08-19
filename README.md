@@ -16,7 +16,7 @@ pixi run azo-plugin install .
 Installation creates an editable config at:
 
 ```text
-~/.local/share/agent-zoo/plugin-configs/azo-plugin-project-memory/config/project_memory.json
+~/.local/share/agent-zoo/plugin-configs/azo-plugin-project-memory/config/project_memory.yaml
 ```
 
 The `project_memory.system_prompt` value controls the guidance appended to the model-visible system prompt. Launch-time `--config-set project_memory.system_prompt=...` values override the installed file. Set `project_memory.enabled=false` to disable registration, then run `/reload` in an existing TUI session.

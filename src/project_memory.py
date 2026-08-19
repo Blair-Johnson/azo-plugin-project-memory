@@ -14,6 +14,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from agent_utils import Entry, Feature, Tool, estimate_tokens
 from agent_utils.components import (
     CompressToolResults,
@@ -36,7 +38,7 @@ log = logging.getLogger("agent_zoo_user_plugin.project_memory")
 PLUGIN_NAME = "azo-plugin-project-memory"
 CONFIG_SECTION = "project_memory"
 CONFIG_PATH_ENV = "AZO_PROJECT_MEMORY_CONFIG"
-CONFIG_FILENAME = "project_memory.json"
+CONFIG_FILENAME = "project_memory.yaml"
 TABLE_NAME = "azo_project_memories"
 SUPPRESSIONS_ATTR = "project_memory_suppressions"
 SEEN_EVENTS_ATTR = "project_memory_seen_events"
@@ -815,10 +817,10 @@ class ProjectMemorySystemPrompt:
     @classmethod
     def _load_installed_config(cls) -> dict[str, Any]:
         try:
-            loaded = json.loads(cls._config_path().read_text(encoding="utf-8"))
+            loaded = yaml.safe_load(cls._config_path().read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
-        except (OSError, ValueError):
+        except (OSError, yaml.YAMLError):
             log.warning("Could not load project-memory config", exc_info=True)
             return {}
         return loaded if isinstance(loaded, dict) else {}

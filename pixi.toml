@@ -5,11 +5,11 @@ platforms = ["linux-64", "osx-arm64", "osx-64"]
 
 [dependencies]
 python = ">=3.11"
+pyyaml = "*"
 
 [feature.test.dependencies]
 pexpect = ">=4.9"
 regex = "*"
-pyyaml = "*"
 
 [feature.test.pypi-dependencies]
 pytest = ">=8"
@@ -27,4 +27,4 @@ default = []
 rlm = []
 
 [tool.agent-zoo.plugin.config]
-files = ["config/project_memory.json"]
+files = ["config/project_memory.yaml"]
