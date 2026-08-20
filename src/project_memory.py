@@ -59,8 +59,70 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+def _config_enabled(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return value is not False
+
+
 class ProjectMemoryStore:
     """Project-database storage component shared by all memory components."""
+
+    def __init__(
+        self,
+        common_memories: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        self.common_memories = {
+            str(key): dict(value)
+            for key, value in (common_memories or {}).items()
+            if isinstance(value, Mapping)
+        }
+
+    @staticmethod
+    def _common_memory_id(registry_key: str) -> str:
+        digest = hashlib.sha256(
+            f"{PLUGIN_NAME}:common:{registry_key}".encode("utf-8")
+        ).hexdigest()[:6]
+        return f"mem_{digest}"
+
+    def list_common(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        memories = []
+        for raw_key, spec in self.common_memories.items():
+            registry_key = str(raw_key or "").strip()
+            if not registry_key:
+                log.warning("Skipping configured project memory with empty registry key")
+                continue
+            try:
+                content = self._validate_content(spec.get("content"))
+                trigger = self._validate_trigger(spec.get("trigger"))
+            except (AttributeError, ValueError) as exc:
+                log.warning(
+                    "Skipping invalid configured project memory %s: %s",
+                    registry_key or "<empty>",
+                    exc,
+                )
+                continue
+            enabled = _config_enabled(spec.get("enabled", True))
+            if enabled_only and not enabled:
+                continue
+            memories.append(
+                {
+                    "id": self._common_memory_id(registry_key),
+                    "content": content,
+                    "trigger": trigger,
+                    "registry_key": registry_key,
+                    "source": "config",
+                    "enabled": enabled,
+                }
+            )
+        return memories
+
+    def get_common(self, memory_id: str) -> dict[str, Any] | None:
+        memory_id = str(memory_id or "").strip()
+        return next(
+            (memory for memory in self.list_common() if memory["id"] == memory_id),
+            None,
+        )
 
     optional_reads = {"run_db", "agent_db"}
 
@@ -105,6 +167,7 @@ class ProjectMemoryStore:
         cache = getattr(manager, "_special_cache", None)
         if isinstance(cache, dict):
             cache.pop("project_memory", None)
+
     @staticmethod
     def _validate_content(content: str) -> str:
         text = str(content or "").strip()
@@ -136,13 +199,15 @@ class ProjectMemoryStore:
         }
 
     def get(self, state, memory_id: str) -> dict[str, Any] | None:
+        memory_id = str(memory_id or "").strip()
         conn = self.ensure_schema(state)
         row = conn.execute(
             f"SELECT id, content, trigger, created_at, updated_at "
             f"FROM {TABLE_NAME} WHERE id = ?",
-            (str(memory_id or "").strip(),),
+            (memory_id,),
         ).fetchone()
-        return self._memory_from_row(row)
+        memory = self._memory_from_row(row)
+        return memory if memory is not None else self.get_common(memory_id)
 
     def list_all(self, state) -> list[dict[str, Any]]:
         conn = self.ensure_schema(state)
@@ -157,8 +222,11 @@ class ProjectMemoryStore:
         trigger = self._validate_trigger(trigger)
         conn = self.ensure_schema(state)
         now = time.time()
+        reserved_ids = {memory["id"] for memory in self.list_common()}
         for _attempt in range(32):
             memory_id = f"mem_{secrets.token_hex(3)}"
+            if memory_id in reserved_ids:
+                continue
             try:
                 conn.execute(
                     f"INSERT INTO {TABLE_NAME} "
@@ -188,6 +256,10 @@ class ProjectMemoryStore:
         trigger: str | None = None,
     ) -> dict[str, Any]:
         memory_id = str(memory_id or "").strip()
+        if self.get_common(memory_id) is not None:
+            raise ValueError(
+                f"configured common memory {memory_id!r} is read-only; edit the YAML registry"
+            )
         current = self.get(state, memory_id)
         if current is None:
             raise KeyError(f"unknown project memory {memory_id!r}")
@@ -213,6 +285,10 @@ class ProjectMemoryStore:
 
     def delete(self, state, memory_id: str) -> bool:
         memory_id = str(memory_id or "").strip()
+        if self.get_common(memory_id) is not None:
+            raise ValueError(
+                f"configured common memory {memory_id!r} is read-only; edit the YAML registry"
+            )
         conn = self.ensure_schema(state)
         cursor = conn.execute(f"DELETE FROM {TABLE_NAME} WHERE id = ?", (memory_id,))
         conn.commit()
@@ -242,27 +318,52 @@ class ProjectMemoryBuffer:
         return state
 
     def render(self, state) -> ReadonlyBufferView:
+        db_error = None
         try:
             memories = self.store.list_all(state)
         except Exception as exc:
-            text = (
-                "# Project memories\n\n"
-                f"Project database unavailable: {type(exc).__name__}: {exc}\n"
+            memories = []
+            db_error = f"Project database unavailable: {type(exc).__name__}: {exc}"
+
+        common_memories = self.store.list_common()
+        lines = ["# Project memories", "", f"Count: {len(memories)}"]
+        if db_error:
+            lines.extend(["", db_error])
+        for memory in memories:
+            lines.extend(
+                [
+                    "",
+                    f"## {memory['id']}",
+                    f"Trigger regex: {json.dumps(memory['trigger'], ensure_ascii=False)}",
+                    "",
+                    "Content:",
+                    str(memory["content"]),
+                ]
             )
-        else:
-            lines = ["# Project memories", "", f"Count: {len(memories)}"]
-            for memory in memories:
+
+        if common_memories:
+            lines.extend(
+                [
+                    "",
+                    "# Common configured memories",
+                    "",
+                    f"Count: {len(common_memories)}",
+                ]
+            )
+            for memory in common_memories:
                 lines.extend(
                     [
                         "",
                         f"## {memory['id']}",
+                        f"Registry key: {memory['registry_key']}",
+                        f"Enabled: {'yes' if memory['enabled'] else 'no'}",
                         f"Trigger regex: {json.dumps(memory['trigger'], ensure_ascii=False)}",
                         "",
                         "Content:",
                         str(memory["content"]),
                     ]
                 )
-            text = "\n".join(lines).rstrip() + "\n"
+        text = "\n".join(lines).rstrip() + "\n"
         return ReadonlyBufferView(
             id="project_memory",
             path="memory://project",
@@ -495,7 +596,8 @@ class ProjectMemoryRecall:
             memories = self.store.list_all(state)
         except Exception:
             log.debug("project memory database unavailable during recall", exc_info=True)
-            return state
+            memories = []
+        memories.extend(self.store.list_common(enabled_only=True))
         if not memories:
             return state
 
@@ -881,20 +983,77 @@ class ProjectMemorySystemPrompt:
             return rendered
         return str(content).rstrip() + "\n\n" + block
 
+    @staticmethod
+    def _normalize_common_memories(value: Any) -> dict[str, dict[str, Any]]:
+        normalized: dict[str, dict[str, Any]] = {}
+        if isinstance(value, Mapping):
+            for key, spec in value.items():
+                if isinstance(spec, Mapping):
+                    normalized[str(key).strip()] = dict(spec)
+            return {key: spec for key, spec in normalized.items() if key}
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for item in value:
+                if not isinstance(item, Mapping):
+                    continue
+                key = str(item.get("key") or item.get("name") or "").strip()
+                if not key:
+                    continue
+                spec = dict(item)
+                spec.pop("key", None)
+                spec.pop("name", None)
+                normalized[key] = spec
+        return normalized
+
+    @classmethod
+    def common_memories(cls, section: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        bundled_section = cls._load_bundled_config().get(CONFIG_SECTION, {})
+        bundled = (
+            bundled_section.get("common_memories")
+            if isinstance(bundled_section, Mapping)
+            else None
+        )
+        configured = section.get("common_memories") if isinstance(section, Mapping) else None
+        include_bundled = (
+            section.get("include_bundled_memories", True)
+            if isinstance(section, Mapping)
+            else True
+        )
+        result = {}
+        if cls.enabled(include_bundled):
+            result.update(cls._normalize_common_memories(bundled))
+        result.update(cls._normalize_common_memories(configured))
+        return result
+
+    @classmethod
+    def _load_bundled_config(cls) -> dict[str, Any]:
+        path = Path(__file__).resolve().parents[1] / "config" / CONFIG_FILENAME
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, yaml.YAMLError):
+            log.warning("Could not load bundled project-memory config", exc_info=True)
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
     @classmethod
     def effective_section(cls, config: Any) -> dict[str, Any]:
         installed = cls._load_installed_config().get(CONFIG_SECTION, {})
         explicit = (config or {}).get(CONFIG_SECTION, {})
         merged = dict(installed) if isinstance(installed, Mapping) else {}
         if isinstance(explicit, Mapping):
-            merged.update(explicit)
+            for key, value in explicit.items():
+                if key == "common_memories":
+                    registry = cls._normalize_common_memories(merged.get(key))
+                    registry.update(cls._normalize_common_memories(value))
+                    merged[key] = registry
+                else:
+                    merged[key] = value
         return merged
 
     @staticmethod
     def enabled(value: Any) -> bool:
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return value is not False
+        return _config_enabled(value)
 
     @classmethod
     def _load_installed_config(cls) -> dict[str, Any]:
@@ -932,7 +1091,7 @@ def register_features(builder, *, session, config):
     if not ProjectMemorySystemPrompt.enabled(section.get("enabled", True)):
         return
     prompt = str(section.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
-    store = ProjectMemoryStore()
+    store = ProjectMemoryStore(ProjectMemorySystemPrompt.common_memories(section))
     recall = ProjectMemoryRecall(store)
     builder.add(
         Feature(

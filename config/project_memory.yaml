@@ -1,15 +1,32 @@
 project_memory:
   enabled: true
   system_prompt: >-
-    Use project memories for durable project-specific facts, decisions, constraints,
-    and procedures that should be recalled in future sessions. Call record_memory with
-    concise standalone content and a selective regular expression that matches future
-    transcript messages indicating relevance. Refine noisy memories with update_memory
-    or temporarily quiet them with suppress_memory; delete obsolete memories. Do not
-    record secrets, transient progress, or facts already maintained in authoritative
-    project files.
+    The agent uses the record_memory tool to improve the way that it interacts with
+    the user and other unfamilar systems over time. When the agent observes that it
+    has done something incorrectly, either through its own discovery or the observation
+    that it frustrated the user, or that the user has issued corrective instruction,
+    the agent will reflect on why it performed poorly, the information that it didn't
+    know, the procedure that it executed poorly, or the meta process that it took
+    before arriving at a bad outcome. Using these reflections, the agent considers
+    what short note it could write to its future self to preempt repeating the same
+    failure. It then considers how it could identify times in the future where it will
+    need this information, and it uses the record_memory tool to attach a standalone
+    'note to future self' style message to a detailed regex trigger condition classifier.
+    The regex will be executed against future user messages, agent messages, agent tool
+    calls, and tool call results. If the regex matches, the future agent is presented
+    with the memory. The agent uses this system to provide forward-looking contextual
+    guidance to itself. Project memories are available for viewing at all times in
+    the project_memory buffer.
     Example of a high-signal harness memory: Agent Zoo loads the repository
     config/project_memory.yaml as a template, while the installed
     plugin-configs/azo-plugin-project-memory/config/project_memory.yaml controls the
     running agent. Reinstall after source changes; run /reload after installed-guidance
     changes. Trigger: `(?is)(?:(?=[\s\S]{0,320}\b(?:write_file|save|open_buffer|str_replace|insert_lines|append_lines|terminal_run|vim|view)\b)(?=[\s\S]{0,320}\b(?:plugin-configs|azo-plugin-project-memory[\\/]+config)\b)(?=[\s\S]{0,320}\bproject_memory\.ya?ml\b)|(?=[\s\S]{0,240}\b(?:azo-plugin|pixi)\b)(?=[\s\S]{0,240}\b(?:install|reinstall|force)\b)(?=[\s\S]{0,240}\bazo-plugin-project-memory\b)|(?=[\s\S]{0,220}\b(?:reload|restart)\b)(?=[\s\S]{0,220}\b(?:project[-_ ]memory|plugin[-_ ]config|project_memory\.ya?ml)\b))`. This should match relevant configuration edits, plugin lifecycle events, and reloads, but not unrelated file saves, installs, or restarts.
+  include_bundled_memories: true
+  common_memories:
+    frustration_reflection:
+      enabled: true
+      content: >-
+        Treat clear user frustration as a signal to pause and reflect. Identify the concrete mistake, the process failure that caused it, and the durable lesson. If the lesson is reusable and project-specific, record a separate concise memory with a selective trigger; otherwise correct course and continue.
+      trigger: >-
+        (?is)\Auser\s+message\s*:\s*[\s\S]{0,2000}?(?:\b(?:fuck(?:ing|ed)?|shit|damn|hell)\b|\b(?:jesus\s+christ|what\s+the\s+fuck|why\s+the\s+fuck|for\s+fuck['’]?s\s+sake)\b|\b(?:don['’]?t|do\s+not)\s+be\b[\s\S]{0,120}\b(?:stupid|ridiculous|idiot|useless)\b|\b(?:you|this|that|it)\b[\s\S]{0,180}\b(?:ignored|overwrote|changed|failed|broke|forgot|missed|misunderstood|overlooked|disregarded|didn['’]?t\s+(?:follow|listen|do|use))\b|\b(?:i\s+(?:asked|told|said|wanted|specified|explained))\b[\s\S]{0,180}\b(?:but|instead|ignored|didn['’]?t|failed)\b|\b(?:didn['’]?t|doesn['’]?t|not)\b[\s\S]{0,40}\b(?:trigger|work|fire|match|reliable|obvious|sense)\b|\b(?:brittle|unreliable|actual\s+frustration)\b|\b(?:what\s+(?:the|are|did)|why\s+(?:are|did)|how\s+many\s+times)\b[\s\S]{0,180}\b(?:you|do\s+i|have\s+i|follow|listen|ask|tell|explain|instruction)\b)

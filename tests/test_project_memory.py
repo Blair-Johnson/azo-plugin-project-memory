@@ -263,6 +263,146 @@ def test_record_memory_backtest_respects_provider_compaction_boundary(project_db
     assert "- entry 3: user message: Current NEEDLE123 remains relevant" in result
     assert "entry 1" not in result
 
+def test_common_memories_are_runtime_only_stable_and_buffered(project_db):
+    state = state_for(project_db)
+    store = pm.ProjectMemoryStore(
+        {
+            "frustration_reflection": {
+                "enabled": True,
+                "content": "Reflect before continuing.",
+                "trigger": r"frustration",
+            }
+        }
+    )
+
+    store(state)
+    configured = store.list_common()
+    assert len(configured) == 1
+    memory = configured[0]
+    assert memory["id"].startswith("mem_")
+    assert len(memory["id"]) == 10
+    assert store.list_all(state) == []
+
+    store(state)
+    assert store.list_common()[0]["id"] == memory["id"]
+
+    pm.ProjectMemoryBuffer(store)(state)
+    rendered = state.buffer_manager.resolve_for_read(state, "project_memory").text
+    assert "# Common configured memories" in rendered
+    assert memory["id"] in rendered
+    assert "Enabled: yes" in rendered
+    assert "Reflect before continuing." in rendered
+
+
+def test_enabled_common_memory_is_recalled_without_project_row(project_db):
+    state = state_for(project_db, step=2)
+    store = pm.ProjectMemoryStore(
+        {
+            "configured": {
+                "enabled": True,
+                "content": "Configured guidance.",
+                "trigger": r"configured topic",
+            }
+        }
+    )
+    add_message(state, "user", "Discuss the configured topic now", step=2)
+
+    pm.ProjectMemoryRecall(store)(state)
+
+    configured = store.list_common()[0]
+    assert state.project_memory_pending_recalls == [
+        {"id": configured["id"], "content": configured["content"]}
+    ]
+    assert store.list_all(state) == []
+
+
+def test_disabled_common_memory_is_not_recalled_but_remains_visible(project_db):
+    state = state_for(project_db, step=2)
+    store = pm.ProjectMemoryStore(
+        {
+            "disabled": {
+                "enabled": False,
+                "content": "Disabled guidance.",
+                "trigger": r"disabled topic",
+            }
+        }
+    )
+    add_message(state, "user", "Discuss disabled topic now", step=2)
+
+    pm.ProjectMemoryRecall(store)(state)
+
+    assert state.project_memory_pending_recalls == []
+    assert store.list_common()[0]["enabled"] is False
+
+
+def test_common_memory_crud_is_read_only(project_db):
+    state = state_for(project_db)
+    store = pm.ProjectMemoryStore(
+        {
+            "configured": {
+                "content": "Edit this in YAML.",
+                "trigger": r"configured",
+            }
+        }
+    )
+    store(state)
+    memory_id = store.list_common()[0]["id"]
+
+    with pytest.raises(ValueError, match="read-only"):
+        store.update(state, memory_id, content="Project override")
+    with pytest.raises(ValueError, match="read-only"):
+        store.delete(state, memory_id)
+    assert store.list_all(state) == []
+
+
+def test_common_memory_config_merges_bundled_and_user_entries(monkeypatch):
+    monkeypatch.setattr(
+        pm.ProjectMemorySystemPrompt,
+        "_load_bundled_config",
+        lambda: {
+            "project_memory": {
+                "common_memories": {
+                    "bundled": {"content": "Bundled", "trigger": "bundled"},
+                    "shared": {"content": "Old", "trigger": "old"},
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        pm.ProjectMemorySystemPrompt,
+        "_load_installed_config",
+        lambda: {
+            "project_memory": {
+                "common_memories": {
+                    "installed": {"content": "Installed", "trigger": "installed"},
+                }
+            }
+        },
+    )
+
+    section = pm.ProjectMemorySystemPrompt.effective_section(
+        {
+            "project_memory": {
+                "common_memories": {
+                    "explicit": {"content": "Explicit", "trigger": "explicit"},
+                    "shared": {"content": "New", "trigger": "new"},
+                }
+            }
+        }
+    )
+    common = pm.ProjectMemorySystemPrompt.common_memories(section)
+
+    assert set(common) == {"bundled", "installed", "explicit", "shared"}
+    assert common["shared"]["content"] == "New"
+
+    disabled_section = {
+        **section,
+        "include_bundled_memories": False,
+    }
+    disabled_common = pm.ProjectMemorySystemPrompt.common_memories(disabled_section)
+    assert set(disabled_common) == {"installed", "explicit", "shared"}
+
+
 def test_recall_buffers_after_user_and_delivers_after_assistant(project_db):
     state = state_for(project_db, step=4)
     store = pm.ProjectMemoryStore()
