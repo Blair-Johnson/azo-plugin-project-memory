@@ -8,3 +8,8 @@ project_memory:
     or temporarily quiet them with suppress_memory; delete obsolete memories. Do not
     record secrets, transient progress, or facts already maintained in authoritative
     project files.
+    Example of a high-signal harness memory: Agent Zoo loads the repository
+    config/project_memory.yaml as a template, while the installed
+    plugin-configs/azo-plugin-project-memory/config/project_memory.yaml controls the
+    running agent. Reinstall after source changes; run /reload after installed-guidance
+    changes. Trigger: `(?is)(?:(?=[\s\S]{0,320}\b(?:write_file|save|open_buffer|str_replace|insert_lines|append_lines|terminal_run|vim|view)\b)(?=[\s\S]{0,320}\b(?:plugin-configs|azo-plugin-project-memory[\\/]+config)\b)(?=[\s\S]{0,320}\bproject_memory\.ya?ml\b)|(?=[\s\S]{0,240}\b(?:azo-plugin|pixi)\b)(?=[\s\S]{0,240}\b(?:install|reinstall|force)\b)(?=[\s\S]{0,240}\bazo-plugin-project-memory\b)|(?=[\s\S]{0,220}\b(?:reload|restart)\b)(?=[\s\S]{0,220}\b(?:project[-_ ]memory|plugin[-_ ]config|project_memory\.ya?ml)\b))`. This should match relevant configuration edits, plugin lifecycle events, and reloads, but not unrelated file saves, installs, or restarts.
