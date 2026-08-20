@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 from agent_utils import Entry, Feature, Session, State
+from agent_utils.types import ToolCall
 from agent_zoo import pipelines
 from agent_zoo.modes import default_modes, rlm_modes
 from agent_utils.files.buffer_manager import BufferManager
@@ -47,6 +49,38 @@ def add_message(state: State, role: str, content: str, **message) -> Entry:
     item = entry(len(state.entries), role, content, step=message_step, **message)
     state.entries.append(item)
     return item
+
+
+def call_tool(tool, state: State, **kwargs) -> str:
+    """Dispatch one tool call against the in-memory transcript."""
+    tool_call = ToolCall(
+        id=f"call-{len(state.entries)}",
+        name=tool.name,
+        raw_args=json.dumps(kwargs),
+        parsed_args=kwargs,
+    )
+    assistant = add_message(
+        state,
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": tool_call.id,
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "arguments": tool_call.raw_args,
+                },
+            }
+        ],
+    )
+    assistant.tool_calls = [tool_call]
+    state.pending_tool_calls = [tool_call]
+    tool.transform(state)
+    state.pending_tool_calls = []
+    assert tool_call.result is not None
+    assert tool_call.error is False
+    return str(tool_call.result)
 
 
 def test_store_crud_and_short_ids(project_db):
@@ -110,6 +144,124 @@ def test_local_crud_invalidates_same_step_buffer_cache(project_db):
     current = state.buffer_manager.resolve_for_read(state, "project_memory")
     assert memory["id"] in current.text
 
+
+def test_record_memory_backtests_messages_and_tool_results(project_db):
+    state = state_for(project_db, step=4)
+    store = pm.ProjectMemoryStore()
+    recall = pm.ProjectMemoryRecall(store)
+    record = pm.RecordMemory(store, recall)
+    add_message(state, "user", "The release failed during staging.", step=1)
+    add_message(
+        state,
+        "assistant",
+        "",
+        step=2,
+        tool_calls=[
+            {
+                "id": "call-inspect",
+                "type": "function",
+                "function": {
+                    "name": "inspect_release",
+                    "arguments": '{"environment": "staging"}',
+                },
+            }
+        ],
+    )
+    add_message(state, "tool", "deployment failed in staging", step=3, tool_call_id="call-inspect")
+
+    result = call_tool(
+        record,
+        state,
+        content="Remember the release recovery procedure.",
+        trigger=r"(?:release|deployment)\s+failed",
+    )
+
+    assert "Backtest: trigger matched 2 events" in result
+    assert "- entry 3: Tool result: deployment failed in staging" in result
+    assert "- entry 1: user message: The release failed during staging." in result
+
+
+def test_record_memory_reports_no_backtest_matches(project_db):
+    state = state_for(project_db, step=3)
+    store = pm.ProjectMemoryStore()
+    recall = pm.ProjectMemoryRecall(store)
+    record = pm.RecordMemory(store, recall)
+    add_message(state, "user", "The build completed successfully.", step=2)
+
+    result = call_tool(
+        record,
+        state,
+        content="Remember the deployment checklist.",
+        trigger=r"NEVER_MATCH_[0-9]+",
+    )
+
+    assert "Backtest: no messages or tool calls matched in the active context window." in result
+
+
+def test_record_memory_backtest_respects_harness_handoff_boundary(project_db):
+    state = state_for(project_db, step=8)
+    store = pm.ProjectMemoryStore()
+    recall = pm.ProjectMemoryRecall(store)
+    record = pm.RecordMemory(store, recall)
+    state.entries = [
+        entry(0, "system", "system", step=0),
+        entry(1, "assistant", "Old NEEDLE123 history", step=1),
+        entry(2, "assistant", "old history", step=2),
+        entry(3, "user", "Current NEEDLE123 remains relevant", step=8),
+    ]
+    state.context_compaction = SimpleNamespace(
+        handoff_docs=[
+            {
+                "text": "Summary without the old match.",
+                "source_end_turn": 7,
+                "source_end_entry_index": 2,
+                "preserved_tail_start_entry_index": 3,
+            }
+        ]
+    )
+
+    result = call_tool(
+        record,
+        state,
+        content="Remember the current deployment state.",
+        trigger=r"NEEDLE[0-9]+",
+    )
+
+    assert "Backtest: trigger matched 1 event" in result
+    assert "- entry 3: user message: Current NEEDLE123 remains relevant" in result
+    assert "entry 1" not in result
+
+
+def test_record_memory_backtest_respects_provider_compaction_boundary(project_db):
+    state = state_for(project_db, step=9)
+    store = pm.ProjectMemoryStore()
+    recall = pm.ProjectMemoryRecall(store)
+    record = pm.RecordMemory(store, recall)
+    state.entries = [
+        entry(0, "system", "system", step=0),
+        entry(1, "assistant", "Old NEEDLE123 history", step=1),
+        entry(
+            2,
+            "assistant",
+            "",
+            step=8,
+            provider_tool_calls=[
+                {"type": "compaction", "encrypted_content": "opaque-provider-state"}
+            ],
+        ),
+        entry(3, "user", "Current NEEDLE123 remains relevant", step=9),
+    ]
+
+    result = call_tool(
+        record,
+        state,
+        content="Remember the current deployment state.",
+        trigger=r"NEEDLE[0-9]+",
+    )
+
+    assert "Backtest: trigger matched 1 event" in result
+    assert "- entry 3: user message: Current NEEDLE123 remains relevant" in result
+    assert "entry 1" not in result
 
 def test_recall_buffers_after_user_and_delivers_after_assistant(project_db):
     state = state_for(project_db, step=4)

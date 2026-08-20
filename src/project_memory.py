@@ -46,6 +46,8 @@ PENDING_RECALLS_ATTR = "project_memory_pending_recalls"
 BOOTSTRAPPED_ATTR = "project_memory_scan_bootstrapped"
 LAST_ENTRY_COUNT_ATTR = "project_memory_last_entry_count"
 MAX_SEEN_EVENTS = 4096
+MAX_BACKTEST_MATCHES = 12
+MAX_BACKTEST_EXCERPT_CHARS = 600
 DEFAULT_SYSTEM_PROMPT = (
     "Use project memories for durable project-specific facts, decisions, constraints, "
     "and procedures that should be recalled in future sessions. Call record_memory with "
@@ -303,6 +305,13 @@ class ProjectMemoryTool(Tool):
 class RecordMemory(ProjectMemoryTool):
     """Save a project-scoped memory with a regular-expression trigger."""
 
+    reads = {"entries", "step"}
+    optional_reads = {"run_db", "agent_db", "context_compaction"}
+
+    def __init__(self, store: ProjectMemoryStore, recall: "ProjectMemoryRecall") -> None:
+        super().__init__(store)
+        self.recall = recall
+
     @staticmethod
     def fn(content: str, trigger: str) -> str:
         """Save durable project knowledge for later regex-triggered recall.
@@ -313,7 +322,39 @@ class RecordMemory(ProjectMemoryTool):
         """
 
     def execute(self, state, *, content: str, trigger: str) -> str:
-        return self._format(self.store.create(state, content, trigger), "Recorded")
+        memory = self.store.create(state, content, trigger)
+        current_call_ids = {
+            f"tool-call:{getattr(tool_call, 'id', '')}"
+            for tool_call in getattr(state, "pending_tool_calls", ())
+            if getattr(tool_call, "name", "") == self.name and getattr(tool_call, "id", None)
+        }
+        matches, truncated = self.recall.backtest(
+            state,
+            trigger,
+            exclude_event_ids=current_call_ids,
+        )
+        result = self._format(memory, "Recorded")
+        if not matches:
+            return result + "\nBacktest: no messages or tool calls matched in the active context window."
+
+        count = len(matches)
+        unit = "event" if count == 1 else "events"
+        suffix = (
+            f"; showing the most recent {MAX_BACKTEST_MATCHES}"
+            if truncated
+            else ""
+        )
+        lines = [
+            result,
+            f"Backtest: trigger matched {count} {unit} in the active context window"
+            f" (most recent first{suffix}):",
+        ]
+        for match in matches:
+            excerpt = " ".join(str(match["text"]).strip().split())
+            if len(excerpt) > MAX_BACKTEST_EXCERPT_CHARS:
+                excerpt = excerpt[:MAX_BACKTEST_EXCERPT_CHARS].rstrip() + "..."
+            lines.append(f"- {match['label']}: {excerpt}")
+        return "\n".join(lines)
 
 
 class UpdateMemory(ProjectMemoryTool):
@@ -530,7 +571,7 @@ class ProjectMemoryRecall:
                 continue
             role = str(message.get("role") or "")
             content = self._content_text(message.get("content"))
-            if content and role != "system":
+            if content and role not in {"system", "tool"}:
                 event_id = self._hashed_event_id(
                     "message", entry_index, entry_step, message_index, role, content
                 )
@@ -566,20 +607,61 @@ class ProjectMemoryRecall:
                 events.append((event_id, f"Tool result:\n{content}"))
         return events
 
-    def _active_context_text(self, state, entries) -> str:
+    def backtest(
+        self,
+        state,
+        trigger: str,
+        *,
+        exclude_event_ids: Sequence[str] = (),
+    ) -> tuple[list[dict[str, str]], bool]:
+        """Test a trigger against the active transcript context.
+
+        Results are returned most-recent-first and are capped so a recording
+        tool result cannot overwhelm the model context.  The optional event
+        exclusion is used to avoid matching the active ``record_memory`` call
+        against its own trigger argument.
+        """
+        pattern = re.compile(str(trigger))
+        entries = list(getattr(state, "entries", []) or [])
+        start, handoff_text = self._active_context_window(state, entries)
+        excluded = {str(event_id) for event_id in exclude_event_ids}
+        candidates: list[tuple[str, str]] = []
+        if handoff_text:
+            candidates.append(("handoff document", handoff_text))
+
+        for position in range(start, len(entries)):
+            entry = entries[position]
+            if bool(self._get(entry, "forgotten", False)):
+                continue
+            entry_index = self._int_value(self._get(entry, "index", position), position)
+            for event_id, text in self._entry_events(entry, position):
+                if event_id not in excluded and text:
+                    candidates.append((f"entry {entry_index}", text))
+
+        matches: list[dict[str, str]] = []
+        truncated = False
+        for label, text in reversed(candidates):
+            if not pattern.search(text):
+                continue
+            if len(matches) >= MAX_BACKTEST_MATCHES:
+                truncated = True
+                break
+            matches.append({"label": label, "text": text})
+        return matches, truncated
+
+    def _active_context_window(self, state, entries) -> tuple[int, str]:
         harness_position, handoff_text = self._harness_boundary(state, entries)
         provider_position = self._provider_boundary(entries)
 
         if provider_position is not None and (
             harness_position is None or provider_position >= harness_position
         ):
-            start = provider_position + 1
-            prefix = []
-        else:
-            start = harness_position or 0
-            prefix = [handoff_text] if handoff_text else []
+            return provider_position + 1, ""
+        return harness_position or 0, handoff_text
 
-        parts = list(prefix)
+    def _active_context_text(self, state, entries) -> str:
+        start, handoff_text = self._active_context_window(state, entries)
+        parts = [handoff_text] if handoff_text else []
         for entry in entries[start:]:
             if bool(self._get(entry, "forgotten", False)):
                 continue
@@ -851,17 +933,18 @@ def register_features(builder, *, session, config):
         return
     prompt = str(section.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
     store = ProjectMemoryStore()
+    recall = ProjectMemoryRecall(store)
     builder.add(
         Feature(
             name="project_memory",
             components=[
                 store,
                 ProjectMemoryBuffer(store),
-                RecordMemory(store),
+                RecordMemory(store, recall),
                 UpdateMemory(store),
                 SuppressMemory(store),
                 DeleteMemory(store),
-                ProjectMemoryRecall(store),
+                recall,
                 ProjectMemoryDelivery(),
                 ProjectMemorySystemPrompt(prompt),
             ],
