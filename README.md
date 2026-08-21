@@ -6,7 +6,7 @@ The plugin stores memories in the current Agent Zoo project's shared SQLite data
 
 The feature provides `record_memory`, `update_memory`, `suppress_memory`, and `delete_memory`. Suppression is session-local and measured in pipeline turns; memory records themselves propagate between running sessions because the database is queried on every pass.
 
-The plugin registers three readonly buffer surfaces. `project_memory` shows the project’s regex memories. `project_sessions` lists saved previous sessions newest-first, excluding the active session and every RLM session. Each listed `ses_<prefix>` ID lazily renders a compact transcript containing only genuine user messages and final assistant responses, with source entry indexes and line ranges into the authoritative `session.json` file.
+The plugin registers three readonly buffer surfaces. `project_memory` shows the project’s regex memories. `project_sessions` lists saved previous sessions newest-first, excluding the active session and every RLM session. Each listed `ses_<prefix>` ID lazily renders a compact reverse-chronological projection: complete turn blocks appear newest-first while each block preserves the user message followed by its final assistant response. Message delimiters retain source entry indexes and line ranges into the authoritative `session.json` file.
 
 Compact session projections are cached as disposable atomic sidecars under the project’s `plugin-data/project-memory/compact` directory. The source transcript remains authoritative; its content digest and indexed session metadata invalidate stale sidecars. Rendering the session index never parses transcripts or creates cache files.
 

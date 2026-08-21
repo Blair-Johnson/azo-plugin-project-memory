@@ -65,7 +65,7 @@ MAX_BACKTEST_EXCERPT_CHARS = 600
 PROJECT_SESSIONS_BUFFER_ID = "project_sessions"
 SESSION_BUFFER_PREFIX = "ses_"
 MIN_SESSION_PREFIX_LENGTH = 8
-COMPACT_CACHE_VERSION = 1
+COMPACT_CACHE_VERSION = 2
 PROJECT_SESSION_RENDER_ATTR = "_project_session_memory_render"
 PROJECT_SESSION_INDEX_RENDER_ATTR = "_project_session_memory_index_render"
 CORE_SYSTEM_PROMPT = (
@@ -78,9 +78,19 @@ CORE_SYSTEM_PROMPT = (
     "project files."
 )
 SESSION_SYSTEM_PROMPT = (
-    "When a request depends on work from an earlier project session and the needed "
-    "context is absent, view project_sessions, choose the most relevant recent session, "
-    "and grep or view its listed ses_ buffer before acting."
+    "When a request appears to depend on work from an earlier project session and the "
+    "necessary context is not already available, view project_sessions. It indexes prior "
+    "sessions by recent activity and lists a ses_ buffer for each; use the titles, "
+    "descriptions, and timestamps to choose the most relevant session or sessions. "
+    "Opening a listed ses_ buffer produces a compact reverse-chronological projection "
+    "containing the user message and final assistant response from each turn, with newer "
+    "turns first and tool activity omitted. Read from the beginning through a substantial "
+    "contiguous sequence of turns until you have enough context; do not stop at the first "
+    "turn or treat it as a summary. If a recent turn depends on an older decision, "
+    "continue downward into earlier turns. For an unusually long buffer, use grep only to "
+    "locate a relevant area, then read the surrounding turn blocks. Use the Source "
+    "Transcript path and entry/line pointers when omitted tool activity or full-session "
+    "detail is needed."
 )
 DEFAULT_SYSTEM_PROMPT = f"{CORE_SYSTEM_PROMPT} {SESSION_SYSTEM_PROMPT}"
 
@@ -420,9 +430,10 @@ def _build_compact_transcript(
         f"Created (UTC): {_format_utc(session.get('created_at'))}",
         f"Updated (UTC): {_format_utc(session.get('updated_at'))}",
         f"Buffer Generated (UTC): {_format_utc(generated_at)}",
+        "Order: Newest turn first",
         f"Source Transcript: {source.resolve()}",
     ]
-    for turn in _compact_turns(entries):
+    for turn in reversed(_compact_turns(entries)):
         lines.extend(
             [
                 "",

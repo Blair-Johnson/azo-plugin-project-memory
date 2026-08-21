@@ -366,6 +366,12 @@ def test_project_session_index_and_compact_buffers_are_lazy_and_filtered(tmp_pat
     assert "Updated (UTC): 1970-01-01 00:11:40" in compact.text
     assert "Buffer Generated (UTC): 2023-11-14 22:13:20" in compact.text
     assert f"Source Transcript: {recent_source.resolve()}" in compact.text
+    assert "Order: Newest turn first" in compact.text
+    newest_user = compact.text.index("USER [entry 6, lines ")
+    newest_assistant = compact.text.index("ASSISTANT [entry 7, lines ")
+    older_user = compact.text.index("USER [entry 1, lines ")
+    older_assistant = compact.text.index("ASSISTANT [entry 4, lines ")
+    assert newest_user < newest_assistant < older_user < older_assistant
     assert "USER [entry 1, lines " in compact.text
     assert "ASSISTANT [entry 4, lines " in compact.text
     assert "USER [entry 6, lines " in compact.text

@@ -19,9 +19,19 @@ project_memory:
     with the memory. The agent uses this system to provide forward-looking contextual
     guidance to itself. Project memories are available for viewing at all times in
     the project_memory buffer.
-    When a request depends on work from an earlier project session and the needed
-    context is absent, view the project_sessions buffer, choose the most relevant
-    recent session, and grep or view its listed ses_ buffer before acting.
+    When a request appears to depend on work from an earlier project session and the
+    necessary context is not already available, view project_sessions. It indexes prior
+    sessions by recent activity and lists a ses_ buffer for each; use the titles,
+    descriptions, and timestamps to choose the most relevant session or sessions.
+    Opening a listed ses_ buffer produces a compact reverse-chronological projection
+    containing the user message and final assistant response from each turn, with newer
+    turns first and tool activity omitted. Read from the beginning through a substantial
+    contiguous sequence of turns until you have enough context; do not stop at the first
+    turn or treat it as a summary. If a recent turn depends on an older decision,
+    continue downward into earlier turns. For an unusually long buffer, use grep only to
+    locate a relevant area, then read the surrounding turn blocks. Use the Source
+    Transcript path and entry/line pointers when omitted tool activity or full-session
+    detail is needed.
     Example of a high-signal harness memory: Agent Zoo loads the repository
     config/project_memory.yaml as a template, while the installed
     plugin-configs/azo-plugin-project-memory/config/project_memory.yaml controls the
