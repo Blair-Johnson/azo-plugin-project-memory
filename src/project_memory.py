@@ -1213,7 +1213,12 @@ class ProjectMemoryRecall:
     """Recall matching memories after transcript tool results are consolidated."""
 
     reads = {"entries", "step"}
-    optional_reads = {"run_db", "agent_db", "context_compaction"}
+    optional_reads = {
+        "run_db",
+        "agent_db",
+        "context_compaction",
+        "_rlm_restore_ready",
+    }
     writes = {
         SEEN_EVENTS_ATTR,
         PENDING_RECALLS_ATTR,
@@ -1231,9 +1236,17 @@ class ProjectMemoryRecall:
 
     def __init__(self, store: ProjectMemoryStore) -> None:
         self.store = store
+        self._restore_deferred = False
 
     def __call__(self, state):
+        if getattr(state, "_rlm_restore_ready", True) is False:
+            self._restore_deferred = True
+            return state
         entries = list(getattr(state, "entries", []) or [])
+        if self._restore_deferred:
+            self._restore_deferred = False
+            self._new_events(state, entries, baseline_only=True)
+            return state
         events = self._new_events(state, entries)
         if not events:
             return state
@@ -1279,7 +1292,13 @@ class ProjectMemoryRecall:
             queued_ids.add(memory_id)
         return state
 
-    def _new_events(self, state, entries) -> list[tuple[str, str]]:
+    def _new_events(
+        self,
+        state,
+        entries,
+        *,
+        baseline_only: bool = False,
+    ) -> list[tuple[str, str]]:
         seen_order = [str(item) for item in (getattr(state, SEEN_EVENTS_ATTR) or [])]
         seen = set(seen_order)
         current_ids: list[str] = []
@@ -1293,7 +1312,7 @@ class ProjectMemoryRecall:
                 current_ids.append(event_id)
                 if event_id in seen:
                     continue
-                if bootstrapped or entry_step >= current_step:
+                if not baseline_only and (bootstrapped or entry_step >= current_step):
                     candidates.append((event_id, text))
                 seen.add(event_id)
                 seen_order.append(event_id)

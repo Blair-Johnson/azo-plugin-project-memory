@@ -1108,3 +1108,31 @@ def test_first_recall_scan_baselines_existing_transcript(project_db):
     add_message(state, "assistant", "New startup discussion.", step=2)
     recall(state)
     assert [item["id"] for item in state.project_memory_pending_recalls] == [memory["id"]]
+
+
+def test_pre_restore_pass_does_not_bootstrap_recall_state(project_db):
+    state = state_for(project_db, step=0)
+    store = pm.ProjectMemoryStore()
+    memory = store.create(state, "Historic startup guidance.", r"historic startup")
+    recall = pm.ProjectMemoryRecall(store)
+
+    state._rlm_restore_ready = False
+    recall(state)
+    assert state.project_memory_scan_bootstrapped is False
+    assert state.project_memory_seen_events == []
+
+    state.entries = [
+        entry(0, "system", "restored system prompt", step=0),
+        entry(1, "assistant", "Historic startup discussion.", step=5),
+    ]
+    state.step = 5
+    state._rlm_restore_ready = True
+    recall(state)
+
+    assert state.project_memory_pending_recalls == []
+    assert state.project_memory_scan_bootstrapped is True
+
+    state.step = 6
+    add_message(state, "assistant", "New historic startup discussion.", step=6)
+    recall(state)
+    assert [item["id"] for item in state.project_memory_pending_recalls] == [memory["id"]]
