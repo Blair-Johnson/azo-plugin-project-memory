@@ -1,5 +1,7 @@
 project_memory:
   enabled: true
+  project_sessions:
+    enabled: true
   system_prompt: >-
     The agent uses the record_memory tool to improve the way that it interacts with
     the user and other unfamilar systems over time. When the agent observes that it
@@ -17,6 +19,9 @@ project_memory:
     with the memory. The agent uses this system to provide forward-looking contextual
     guidance to itself. Project memories are available for viewing at all times in
     the project_memory buffer.
+    When a request depends on work from an earlier project session and the needed
+    context is absent, view the project_sessions buffer, choose the most relevant
+    recent session, and grep or view its listed ses_ buffer before acting.
     Example of a high-signal harness memory: Agent Zoo loads the repository
     config/project_memory.yaml as a template, while the installed
     plugin-configs/azo-plugin-project-memory/config/project_memory.yaml controls the

@@ -2,33 +2,47 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import inspect
 import json
 import logging
+import operator
 import os
 import re
 import secrets
 import sqlite3
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from agent_utils import Entry, Feature, Tool, estimate_tokens
+from agent_utils import Entry, Feature, MODEL_RENDER_CHANNEL, Tool, estimate_tokens
 from agent_utils.components import (
     CompressToolResults,
     ConsolidateToolResults,
     ExcludeForgotten,
     MessageRenderer,
+    RenderTransformRegistrar,
     ToolDispatchStart,
     TurnCounter,
-    _wrap_entry_renderer,
     safe_interrupt_text,
 )
 from agent_utils.failed_tool_calls import FailedToolCallRecorder
-from agent_utils.files.buffer_manager import ReadonlyBufferView
+try:
+    from agent_utils.files.buffer_manager import (
+        BufferManager,
+        ReadonlyBufferView,
+        StateBoundSpecialBufferNamespaceProvider,
+    )
+except ImportError:  # pragma: no cover - compatibility error is raised at registration
+    from agent_utils.files.buffer_manager import BufferManager, ReadonlyBufferView
+
+    StateBoundSpecialBufferNamespaceProvider = None
 from agents.system_prompt import SystemPromptSkillList
 from agent_zoo.tools.special_buffers import RegisterSpecialBuffers
 
@@ -48,7 +62,13 @@ LAST_ENTRY_COUNT_ATTR = "project_memory_last_entry_count"
 MAX_SEEN_EVENTS = 4096
 MAX_BACKTEST_MATCHES = 12
 MAX_BACKTEST_EXCERPT_CHARS = 600
-DEFAULT_SYSTEM_PROMPT = (
+PROJECT_SESSIONS_BUFFER_ID = "project_sessions"
+SESSION_BUFFER_PREFIX = "ses_"
+MIN_SESSION_PREFIX_LENGTH = 8
+COMPACT_CACHE_VERSION = 1
+PROJECT_SESSION_RENDER_ATTR = "_project_session_memory_render"
+PROJECT_SESSION_INDEX_RENDER_ATTR = "_project_session_memory_index_render"
+CORE_SYSTEM_PROMPT = (
     "Use project memories for durable project-specific facts, decisions, constraints, "
     "and procedures that should be recalled in future sessions. Call record_memory with "
     "concise standalone content and a selective regular expression that matches future "
@@ -57,12 +77,475 @@ DEFAULT_SYSTEM_PROMPT = (
     "record secrets, transient progress, or facts already maintained in authoritative "
     "project files."
 )
+SESSION_SYSTEM_PROMPT = (
+    "When a request depends on work from an earlier project session and the needed "
+    "context is absent, view project_sessions, choose the most relevant recent session, "
+    "and grep or view its listed ses_ buffer before acting."
+)
+DEFAULT_SYSTEM_PROMPT = f"{CORE_SYSTEM_PROMPT} {SESSION_SYSTEM_PROMPT}"
 
 
 def _config_enabled(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return value is not False
+
+
+
+
+def _session_namespaces_supported() -> bool:
+    if StateBoundSpecialBufferNamespaceProvider is None:
+        return False
+    namespace_register = getattr(BufferManager, "register_special_buffer_namespace", None)
+    exact_register = getattr(BufferManager, "register_special_buffer", None)
+    if not callable(namespace_register) or not callable(exact_register):
+        return False
+    try:
+        return (
+            "replace" in inspect.signature(namespace_register).parameters
+            and "replace" in inspect.signature(exact_register).parameters
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+
+
+def _register_exact_special_buffer(manager, buffer_id: str, provider: Any) -> None:
+    register = manager.register_special_buffer
+    try:
+        supports_replace = "replace" in inspect.signature(register).parameters
+    except (TypeError, ValueError):
+        supports_replace = False
+    if supports_replace:
+        register(buffer_id, provider, replace=True)
+        return
+    if manager.is_special(buffer_id):
+        providers = getattr(manager, "_special_buffers", None)
+        if isinstance(providers, dict):
+            providers[buffer_id] = provider
+            cache = getattr(manager, "_special_cache", None)
+            if isinstance(cache, dict):
+                cache.pop(buffer_id, None)
+            return
+    register(buffer_id, provider)
+
+
+_SESSION_NAMESPACE_WARNING_EMITTED = False
+
+
+def _warn_session_namespaces_unavailable() -> None:
+    global _SESSION_NAMESPACE_WARNING_EMITTED
+    if _SESSION_NAMESPACE_WARNING_EMITTED:
+        return
+    _SESSION_NAMESPACE_WARNING_EMITTED = True
+    log.warning(
+        "Project session buffers are disabled: the loaded Agent Utils build lacks "
+        "replaceable special-buffer namespace support. Core project-memory tools remain active."
+    )
+
+
+def _format_utc(value: Any) -> str:
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return "(unknown)"
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                value = float(raw)
+            except ValueError:
+                return raw
+        else:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        parsed = datetime.fromtimestamp(float(value), timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "(unknown)"
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _one_line_text(value: Any, fallback: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text or fallback
+
+
+def _session_key(session_id: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", str(session_id or "").lower())
+
+
+def _session_buffer_ids(sessions: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    keyed = {
+        str(item.get("session_id") or ""): _session_key(str(item.get("session_id") or ""))
+        for item in sessions
+    }
+    result: dict[str, str] = {}
+    for session_id, key in keyed.items():
+        if not session_id or len(key) < MIN_SESSION_PREFIX_LENGTH:
+            continue
+        length = MIN_SESSION_PREFIX_LENGTH
+        while length < len(key):
+            prefix = key[:length]
+            if sum(other.startswith(prefix) for other in keyed.values()) == 1:
+                break
+            length += 1
+        result[session_id] = SESSION_BUFFER_PREFIX + key[:length]
+    return result
+
+
+def _load_session_index(path: Path) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [dict(item) for item in data if isinstance(item, Mapping)]
+
+
+def _session_source(project_dir: Path, session_id: str) -> Path:
+    if not session_id or Path(session_id).name != session_id or session_id in {".", ".."}:
+        raise ValueError(f"Invalid session id: {session_id!r}")
+    sessions_root = (project_dir / "sessions").resolve()
+    source = (sessions_root / session_id / "session.json").resolve()
+    try:
+        source.relative_to(sessions_root)
+    except ValueError as exc:
+        raise ValueError(f"Session path escapes project: {session_id!r}") from exc
+    return source
+
+
+def _timestamp_sort_value(value: Any) -> float:
+    if isinstance(value, str):
+        raw = value.strip()
+        try:
+            return float(raw)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return 0.0
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return 0.0
+
+
+def _eligible_project_sessions(
+    project_dir: Path,
+    current_session_id: str,
+) -> list[dict[str, Any]]:
+    sessions = []
+    seen: set[str] = set()
+    for item in _load_session_index(project_dir / "sessions" / "index.json"):
+        session_id = str(item.get("session_id") or "").strip()
+        kind = str(item.get("kind") or "").strip().lower()
+        if (
+            not session_id
+            or session_id in seen
+            or session_id == current_session_id
+            or kind.startswith("rlm")
+        ):
+            continue
+        seen.add(session_id)
+        try:
+            source = _session_source(project_dir, session_id)
+        except ValueError:
+            continue
+        if not source.is_file():
+            continue
+        item["session_id"] = session_id
+        item["source_transcript"] = str(source)
+        sessions.append(item)
+    sessions.sort(
+        key=lambda item: _timestamp_sort_value(item.get("updated_at")),
+        reverse=True,
+    )
+    return sessions
+
+
+def _content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        for key in ("text", "content"):
+            if key in value:
+                text = _content_text(value.get(key))
+                if text:
+                    return text
+        return ""
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return "\n".join(filter(None, (_content_text(item) for item in value)))
+    return "" if value is None else str(value)
+
+
+def _entry_line_ranges(source_text: str) -> dict[int, tuple[int, int]]:
+    ranges: dict[int, tuple[int, int]] = {}
+    in_entries = False
+    start_line: int | None = None
+    entry_index: int | None = None
+    index_pattern = re.compile(r'^\s{6}"index":\s*(-?\d+),?\s*$')
+    for line_number, line in enumerate(source_text.splitlines(), start=1):
+        stripped = line.rstrip("\r\n")
+        if not in_entries:
+            if stripped == '  "entries": [':
+                in_entries = True
+            continue
+        if start_line is None:
+            if stripped == "    {":
+                start_line = line_number
+                entry_index = None
+                continue
+            if stripped == "  ],":
+                break
+            continue
+        match = index_pattern.match(stripped)
+        if match:
+            entry_index = int(match.group(1))
+        if stripped in {"    },", "    }"}:
+            if entry_index is not None:
+                ranges[entry_index] = (start_line, line_number)
+            start_line = None
+            entry_index = None
+    return ranges
+
+
+def _entry_has_tool_activity(entry: Mapping[str, Any]) -> bool:
+    if entry.get("tool_calls"):
+        return True
+    for message in entry.get("messages") or []:
+        if not isinstance(message, Mapping):
+            continue
+        if str(message.get("role") or "") == "tool":
+            return True
+        if message.get("tool_calls") or message.get("provider_tool_calls"):
+            return True
+    return False
+
+
+def _role_text(entry: Mapping[str, Any], role: str) -> str:
+    parts = []
+    for message in entry.get("messages") or []:
+        if not isinstance(message, Mapping):
+            continue
+        if str(message.get("role") or "") != role:
+            continue
+        text = _content_text(message.get("content")).strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _compact_turns(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    turns: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, Mapping) or bool(entry.get("system_generated", False)):
+            continue
+        try:
+            entry_index = int(entry.get("index", position))
+        except (TypeError, ValueError):
+            entry_index = position
+        messages = [
+            message
+            for message in (entry.get("messages") or [])
+            if isinstance(message, Mapping)
+        ]
+        assistant_messages = [
+            message for message in messages if str(message.get("role") or "") == "assistant"
+        ]
+        for message in messages:
+            role = str(message.get("role") or "")
+            text = _content_text(message.get("content")).strip()
+            if role == "user" and text:
+                if current is not None:
+                    turns.append(current)
+                current = {
+                    "user_entry": entry_index,
+                    "user_text": text,
+                    "assistant_entry": None,
+                    "assistant_text": "",
+                }
+                continue
+            if role != "assistant" or current is None or not text:
+                continue
+            has_message_tool_calls = bool(
+                message.get("tool_calls") or message.get("provider_tool_calls")
+            )
+            only_assistant_owns_entry_calls = (
+                len(assistant_messages) == 1 and bool(entry.get("tool_calls"))
+            )
+            if has_message_tool_calls or only_assistant_owns_entry_calls:
+                continue
+            current["assistant_entry"] = entry_index
+            current["assistant_text"] = text
+    if current is not None:
+        turns.append(current)
+    return turns
+
+
+def _entry_delimiter(role: str, entry_index: int, ranges: Mapping[int, tuple[int, int]]) -> str:
+    source_range = ranges.get(entry_index)
+    if source_range is None:
+        return f"{role} [entry {entry_index}]"
+    return f"{role} [entry {entry_index}, lines {source_range[0]}-{source_range[1]}]"
+
+
+def _build_compact_transcript(
+    session: Mapping[str, Any],
+    source: Path,
+    *,
+    generated_at: float,
+    source_text: str | None = None,
+) -> str:
+    if source_text is None:
+        source_text = source.read_text(encoding="utf-8")
+    document = json.loads(source_text)
+    raw_entries = document.get("entries")
+    if not isinstance(raw_entries, list):
+        state = document.get("state")
+        raw_entries = state.get("entries") if isinstance(state, Mapping) else []
+    entries = [item for item in (raw_entries or []) if isinstance(item, Mapping)]
+    ranges = _entry_line_ranges(source_text)
+    lines = [
+        f"Session ID: {session['session_id']}",
+        f"Title: {_one_line_text(session.get('title'), '(untitled)')}",
+        f"Description: {_one_line_text(session.get('description'), '(none)')}",
+        f"Created (UTC): {_format_utc(session.get('created_at'))}",
+        f"Updated (UTC): {_format_utc(session.get('updated_at'))}",
+        f"Buffer Generated (UTC): {_format_utc(generated_at)}",
+        f"Source Transcript: {source.resolve()}",
+    ]
+    for turn in _compact_turns(entries):
+        lines.extend(
+            [
+                "",
+                _entry_delimiter("USER", turn["user_entry"], ranges),
+                turn["user_text"],
+            ]
+        )
+        if turn["assistant_entry"] is not None:
+            lines.extend(
+                [
+                    "",
+                    _entry_delimiter("ASSISTANT", turn["assistant_entry"], ranges),
+                    turn["assistant_text"],
+                ]
+            )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _cache_path(project_dir: Path, session_id: str) -> Path:
+    raw_id = str(session_id or "")
+    readable = _session_key(raw_id)[:24] or "session"
+    digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:12]
+    return (
+        project_dir
+        / "plugin-data"
+        / "project-memory"
+        / "compact"
+        / f"{readable}-{digest}.json"
+    )
+
+
+def _read_source_snapshot(source: Path) -> tuple[str, os.stat_result]:
+    for _ in range(3):
+        before = source.stat()
+        source_text = source.read_text(encoding="utf-8")
+        after = source.stat()
+        before_key = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        after_key = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if before_key == after_key:
+            return source_text, after
+    raise OSError(f"Session transcript changed repeatedly while reading: {source}")
+
+
+def _session_cache_metadata(
+    session: Mapping[str, Any],
+    source: Path,
+    source_text: str,
+    source_stat: os.stat_result,
+) -> dict[str, Any]:
+    return {
+        "version": COMPACT_CACHE_VERSION,
+        "source": str(source.resolve()),
+        "source_size": source_stat.st_size,
+        "source_mtime_ns": source_stat.st_mtime_ns,
+        "source_sha256": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+        "title": str(session.get("title") or ""),
+        "description": str(session.get("description") or ""),
+        "created_at": session.get("created_at"),
+        "updated_at": session.get("updated_at"),
+    }
+
+
+def _read_compact_cache(path: Path, expected: Mapping[str, Any]) -> str | None:
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(cached, Mapping) or cached.get("metadata") != dict(expected):
+        return None
+    text = cached.get("text")
+    return text if isinstance(text, str) else None
+
+
+def _atomic_write_cache(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _cached_compact_transcript(
+    project_dir: Path,
+    session: Mapping[str, Any],
+    source: Path,
+    *,
+    generated_at: float,
+) -> str:
+    source_text, source_stat = _read_source_snapshot(source)
+    metadata = _session_cache_metadata(session, source, source_text, source_stat)
+    cache = _cache_path(project_dir, str(session["session_id"]))
+    cached = _read_compact_cache(cache, metadata)
+    if cached is not None:
+        return cached
+    text = _build_compact_transcript(
+        session,
+        source,
+        generated_at=generated_at,
+        source_text=source_text,
+    )
+    try:
+        _atomic_write_cache(cache, {"metadata": metadata, "text": text})
+    except OSError:
+        log.debug("Could not cache compact session transcript %s", source, exc_info=True)
+    return text
 
 
 class ProjectMemoryStore:
@@ -127,10 +610,8 @@ class ProjectMemoryStore:
     optional_reads = {"run_db", "agent_db"}
 
     def __call__(self, state):
-        try:
-            self.ensure_schema(state)
-        except RuntimeError:
-            pass
+        # Startup and restore must not take a project-database write lock.
+        # CRUD methods create the schema lazily when a mutation is requested.
         return state
 
     @staticmethod
@@ -160,6 +641,14 @@ class ProjectMemoryStore:
         )
         conn.commit()
         return conn
+
+    def _existing_schema(self, state):
+        conn = self._agent_db(state).conn
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (TABLE_NAME,),
+        ).fetchone()
+        return conn if exists is not None else None
 
     @staticmethod
     def invalidate_buffer(state) -> None:
@@ -200,7 +689,9 @@ class ProjectMemoryStore:
 
     def get(self, state, memory_id: str) -> dict[str, Any] | None:
         memory_id = str(memory_id or "").strip()
-        conn = self.ensure_schema(state)
+        conn = self._existing_schema(state)
+        if conn is None:
+            return self.get_common(memory_id)
         row = conn.execute(
             f"SELECT id, content, trigger, created_at, updated_at "
             f"FROM {TABLE_NAME} WHERE id = ?",
@@ -210,7 +701,9 @@ class ProjectMemoryStore:
         return memory if memory is not None else self.get_common(memory_id)
 
     def list_all(self, state) -> list[dict[str, Any]]:
-        conn = self.ensure_schema(state)
+        conn = self._existing_schema(state)
+        if conn is None:
+            return []
         rows = conn.execute(
             f"SELECT id, content, trigger, created_at, updated_at "
             f"FROM {TABLE_NAME} ORDER BY created_at, id"
@@ -310,11 +803,15 @@ class ProjectMemoryBuffer:
 
     def __call__(self, state):
         manager = state.buffer_manager
-        cache = getattr(manager, "_special_cache", None)
-        if isinstance(cache, dict):
-            cache.pop("project_memory", None)
-        if not manager.is_special("project_memory"):
-            manager.register_special_buffer("project_memory", self.render)
+
+        # Keep the dynamically loaded plugin instance out of the manager's
+        # provider table. Pipeline initialization recreates this runtime binding.
+        setattr(state, "_project_memory_render", functools.partial(self.render, state))
+        _register_exact_special_buffer(
+            manager,
+            "project_memory",
+            operator.methodcaller("_project_memory_render"),
+        )
         return state
 
     def render(self, state) -> ReadonlyBufferView:
@@ -367,6 +864,154 @@ class ProjectMemoryBuffer:
         return ReadonlyBufferView(
             id="project_memory",
             path="memory://project",
+            text=text,
+        )
+
+
+class ProjectSessionBuffers:
+    """Expose previous project sessions as compact readonly buffers."""
+
+    reads = {"buffer_manager"}
+    optional_reads = {"_agent_zoo_context", "_session_id", "run_db", "agent_db"}
+    writes = {"buffer_manager"}
+
+    def __init__(self, *, clock=time.time) -> None:
+        self.clock = clock
+        self._project_name = ""
+        self._session_id = ""
+
+    def bind_session(
+        self,
+        session_id: str,
+        *,
+        project_name: str | None = None,
+        db: Any | None = None,
+    ) -> None:
+        del db
+        self._session_id = str(session_id or "")
+        if project_name is not None:
+            self._project_name = str(project_name or "default")
+
+    def __call__(self, state):
+        if not _session_namespaces_supported():
+            log.warning(
+                "Project session buffers are unavailable because this Agent Utils "
+                "build lacks special-buffer namespace support"
+            )
+            return state
+        manager = state.buffer_manager
+        context = dict(getattr(state, "_agent_zoo_context", {}) or {})
+        if not self._project_name:
+            self._project_name = str(context.get("project_name") or "")
+        if not self._session_id:
+            self._session_id = str(getattr(state, "_session_id", "") or "")
+
+        setattr(state, PROJECT_SESSION_INDEX_RENDER_ATTR, functools.partial(self.render_index, state))
+        setattr(state, PROJECT_SESSION_RENDER_ATTR, functools.partial(self.render_session, state))
+        manager.register_special_buffer(
+            PROJECT_SESSIONS_BUFFER_ID,
+            operator.methodcaller(PROJECT_SESSION_INDEX_RENDER_ATTR),
+            replace=True,
+        )
+        manager.register_special_buffer_namespace(
+            SESSION_BUFFER_PREFIX,
+            StateBoundSpecialBufferNamespaceProvider(PROJECT_SESSION_RENDER_ATTR),
+            replace=True,
+        )
+        return state
+
+    def _runtime_context(self, state) -> tuple[str, Path, str]:
+        context = dict(getattr(state, "_agent_zoo_context", {}) or {})
+        project_name = self._project_name or str(context.get("project_name") or "default")
+        current_session_id = str(
+            getattr(state, "_session_id", "")
+            or self._session_id
+            or context.get("session_id")
+            or ""
+        )
+        project_dir_raw = str(context.get("project_dir") or "").strip()
+        if project_dir_raw:
+            project_dir = Path(project_dir_raw)
+        else:
+            index_raw = str(context.get("project_session_index") or "").strip()
+            if index_raw:
+                project_dir = Path(index_raw).parent.parent
+            else:
+                run_db = getattr(state, "run_db", None)
+                agent_db = getattr(run_db, "agent_db", None) or getattr(state, "agent_db", None)
+                db_path = str(getattr(agent_db, "path", "") or "").strip()
+                if not db_path:
+                    raise RuntimeError("Agent Zoo project directory is unavailable")
+                project_dir = Path(db_path).parent
+        return project_name, project_dir, current_session_id
+
+    def render_index(self, state) -> ReadonlyBufferView:
+        project_name, project_dir, current_session_id = self._runtime_context(state)
+        sessions = _eligible_project_sessions(project_dir, current_session_id)
+        buffer_ids = _session_buffer_ids(sessions)
+        lines = [
+            "Project Sessions",
+            f"Project: {project_name}",
+            f"Buffer Generated (UTC): {_format_utc(self.clock())}",
+            "Order: Updated (UTC), newest first",
+            "Current session omitted; RLM sessions excluded.",
+            f"Sessions: {len(buffer_ids)}",
+        ]
+        listed = 0
+        for session in sessions:
+            session_id = str(session["session_id"])
+            buffer_id = buffer_ids.get(session_id)
+            if not buffer_id:
+                continue
+            listed += 1
+            lines.extend(
+                [
+                    "",
+                    (
+                        f"{listed}. Buffer: {buffer_id} | Session ID: {session_id} | "
+                        f"Updated (UTC): {_format_utc(session.get('updated_at'))} | "
+                        f"Created (UTC): {_format_utc(session.get('created_at'))}"
+                    ),
+                    (
+                        f"   Title: {_one_line_text(session.get('title'), '(untitled)')} | "
+                        f"Description: {_one_line_text(session.get('description'), '(none)')}"
+                    ),
+                ]
+            )
+        return ReadonlyBufferView(
+            id=PROJECT_SESSIONS_BUFFER_ID,
+            path="project-memory://sessions",
+            text="\n".join(lines).rstrip() + "\n",
+        )
+
+    def render_session(self, state, buffer_id: str) -> ReadonlyBufferView | None:
+        requested = str(buffer_id or "").strip().lower()
+        if not re.fullmatch(r"ses_[0-9a-z]{8,}", requested):
+            return None
+        _, project_dir, current_session_id = self._runtime_context(state)
+        sessions = _eligible_project_sessions(project_dir, current_session_id)
+        buffer_ids = _session_buffer_ids(sessions)
+        session = next(
+            (
+                item
+                for item in sessions
+                if buffer_ids.get(str(item["session_id"])) == requested
+            ),
+            None,
+        )
+        if session is None:
+            return None
+        session_id = str(session["session_id"])
+        source = Path(str(session["source_transcript"]))
+        text = _cached_compact_transcript(
+            project_dir,
+            session,
+            source,
+            generated_at=self.clock(),
+        )
+        return ReadonlyBufferView(
+            id=requested,
+            path=f"project-memory://sessions/{session_id}",
             text=text,
         )
 
@@ -934,12 +1579,11 @@ class ProjectMemoryDelivery:
         return state
 
 
-class ProjectMemorySystemPrompt:
-    """Append configured project-memory guidance to the system prompt."""
+class ProjectMemorySystemPrompt(RenderTransformRegistrar):
+    """Register configured project-memory guidance on the model channel."""
 
     reads = {"entries"}
-    writes = {"entries"}
-    marker_attr = "_azo_project_memory_system_prompt_wrapper"
+    transform_name = "project memory system prompt"
 
     def __init__(self, text: str) -> None:
         self.text = str(text or "").strip()
@@ -948,20 +1592,28 @@ class ProjectMemorySystemPrompt:
         if not self.text or not state.entries:
             return state
         entry = state.entries[0]
+        if self.transform_name in entry.render_transform_names(
+            MODEL_RENDER_CHANNEL,
+            pending=True,
+        ):
+            return state
         block = "# Project Memory\n" + self.text
 
-        def factory(previous_render, _block=block):
-            def render(render_state):
-                messages = previous_render(render_state)
-                if not messages:
-                    return messages
-                first = dict(messages[0])
-                first["content"] = self._append_content(first.get("content"), _block)
-                return [first, *messages[1:]]
+        def transform(messages, _state, _block=block):
+            if not messages:
+                return messages
+            first = dict(messages[0])
+            first["content"] = ProjectMemorySystemPrompt._append_content(
+                first.get("content"),
+                _block,
+            )
+            return [first, *messages[1:]]
 
-            return render
-
-        _wrap_entry_renderer(entry, factory, self.marker_attr)
+        entry.append_render_transform(
+            MODEL_RENDER_CHANNEL,
+            transform,
+            name=self.transform_name,
+        )
         return state
 
     @staticmethod
@@ -1090,38 +1742,59 @@ def register_features(builder, *, session, config):
     section = ProjectMemorySystemPrompt.effective_section(config)
     if not ProjectMemorySystemPrompt.enabled(section.get("enabled", True)):
         return
+
+    session_config = section.get("project_sessions", True)
+    if isinstance(session_config, Mapping):
+        sessions_requested = ProjectMemorySystemPrompt.enabled(
+            session_config.get("enabled", True)
+        )
+    else:
+        sessions_requested = ProjectMemorySystemPrompt.enabled(session_config)
+    sessions_enabled = sessions_requested and _session_namespaces_supported()
+    if sessions_requested and not sessions_enabled:
+        _warn_session_namespaces_unavailable()
+
     prompt = str(section.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
+    if not sessions_enabled:
+        prompt = prompt.replace(SESSION_SYSTEM_PROMPT, "").strip()
+
     store = ProjectMemoryStore(ProjectMemorySystemPrompt.common_memories(section))
     recall = ProjectMemoryRecall(store)
+    components = [
+        store,
+        ProjectMemoryBuffer(store),
+        RecordMemory(store, recall),
+        UpdateMemory(store),
+        SuppressMemory(store),
+        DeleteMemory(store),
+        recall,
+        ProjectMemoryDelivery(),
+        ProjectMemorySystemPrompt(prompt),
+    ]
+    order = [
+        TurnCounter,
+        RegisterSpecialBuffers,
+        ProjectMemoryStore,
+        ProjectMemoryBuffer,
+        ToolDispatchStart,
+        ConsolidateToolResults,
+        FailedToolCallRecorder,
+        ProjectMemoryRecall,
+        ProjectMemoryDelivery,
+        CompressToolResults,
+        SystemPromptSkillList,
+        ProjectMemorySystemPrompt,
+        ExcludeForgotten,
+        MessageRenderer,
+    ]
+    if sessions_enabled:
+        components.insert(2, ProjectSessionBuffers())
+        order.insert(order.index(ToolDispatchStart), ProjectSessionBuffers)
+
     builder.add(
         Feature(
             name="project_memory",
-            components=[
-                store,
-                ProjectMemoryBuffer(store),
-                RecordMemory(store, recall),
-                UpdateMemory(store),
-                SuppressMemory(store),
-                DeleteMemory(store),
-                recall,
-                ProjectMemoryDelivery(),
-                ProjectMemorySystemPrompt(prompt),
-            ],
-            order=[
-                TurnCounter,
-                RegisterSpecialBuffers,
-                ProjectMemoryStore,
-                ProjectMemoryBuffer,
-                ToolDispatchStart,
-                ConsolidateToolResults,
-                FailedToolCallRecorder,
-                ProjectMemoryRecall,
-                ProjectMemoryDelivery,
-                CompressToolResults,
-                SystemPromptSkillList,
-                ProjectMemorySystemPrompt,
-                ExcludeForgotten,
-                MessageRenderer,
-            ],
+            components=components,
+            order=order,
         )
     )
