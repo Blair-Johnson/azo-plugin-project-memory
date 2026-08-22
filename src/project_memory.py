@@ -65,7 +65,7 @@ MAX_BACKTEST_EXCERPT_CHARS = 600
 PROJECT_SESSIONS_BUFFER_ID = "project_sessions"
 SESSION_BUFFER_PREFIX = "ses_"
 MIN_SESSION_PREFIX_LENGTH = 8
-COMPACT_CACHE_VERSION = 2
+COMPACT_CACHE_VERSION = 3
 PROJECT_SESSION_RENDER_ATTR = "_project_session_memory_render"
 PROJECT_SESSION_INDEX_RENDER_ATTR = "_project_session_memory_index_render"
 CORE_SYSTEM_PROMPT = (
@@ -465,14 +465,21 @@ def _cache_path(project_dir: Path, session_id: str) -> Path:
     )
 
 
+def _source_stat_key(source_stat: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        source_stat.st_dev,
+        source_stat.st_ino,
+        source_stat.st_size,
+        source_stat.st_mtime_ns,
+    )
+
+
 def _read_source_snapshot(source: Path) -> tuple[str, os.stat_result]:
     for _ in range(3):
         before = source.stat()
         source_text = source.read_text(encoding="utf-8")
         after = source.stat()
-        before_key = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        after_key = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-        if before_key == after_key:
+        if _source_stat_key(before) == _source_stat_key(after):
             return source_text, after
     raise OSError(f"Session transcript changed repeatedly while reading: {source}")
 
@@ -480,15 +487,15 @@ def _read_source_snapshot(source: Path) -> tuple[str, os.stat_result]:
 def _session_cache_metadata(
     session: Mapping[str, Any],
     source: Path,
-    source_text: str,
     source_stat: os.stat_result,
 ) -> dict[str, Any]:
     return {
         "version": COMPACT_CACHE_VERSION,
         "source": str(source.resolve()),
+        "source_device": source_stat.st_dev,
+        "source_inode": source_stat.st_ino,
         "source_size": source_stat.st_size,
         "source_mtime_ns": source_stat.st_mtime_ns,
-        "source_sha256": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
         "title": str(session.get("title") or ""),
         "description": str(session.get("description") or ""),
         "created_at": session.get("created_at"),
@@ -540,12 +547,18 @@ def _cached_compact_transcript(
     *,
     generated_at: float,
 ) -> str:
-    source_text, source_stat = _read_source_snapshot(source)
-    metadata = _session_cache_metadata(session, source, source_text, source_stat)
     cache = _cache_path(project_dir, str(session["session_id"]))
-    cached = _read_compact_cache(cache, metadata)
-    if cached is not None:
+    before = source.stat()
+    cached = _read_compact_cache(
+        cache,
+        _session_cache_metadata(session, source, before),
+    )
+    after = source.stat()
+    if cached is not None and _source_stat_key(before) == _source_stat_key(after):
         return cached
+
+    source_text, source_stat = _read_source_snapshot(source)
+    metadata = _session_cache_metadata(session, source, source_stat)
     text = _build_compact_transcript(
         session,
         source,

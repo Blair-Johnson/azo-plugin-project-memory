@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pickle
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -398,21 +399,16 @@ def test_compact_session_cache_reuses_and_invalidates_source(tmp_path, monkeypat
         session_id,
         [saved_entry(0, "user", "first"), saved_entry(1, "assistant", "original")],
     )
+    session = {
+        "session_id": session_id,
+        "title": "cache",
+        "description": "",
+        "kind": "default",
+        "created_at": 1.0,
+        "updated_at": 2.0,
+    }
     (project_dir / "sessions" / "index.json").write_text(
-        json.dumps(
-            [
-                {
-                    "session_id": session_id,
-                    "title": "cache",
-                    "description": "",
-                    "kind": "default",
-                    "created_at": 1.0,
-                    "updated_at": 2.0,
-                }
-            ],
-            indent=2,
-        )
-        + "\n",
+        json.dumps([session], indent=2) + "\n",
         encoding="utf-8",
     )
     state = project_session_state(project_dir, "ffffffff-0000-0000-0000-000000000000")
@@ -430,6 +426,24 @@ def test_compact_session_cache_reuses_and_invalidates_source(tmp_path, monkeypat
     second = state.buffer_manager.resolve_for_read(state, "ses_344655c1")
     assert first.text == second.text
     assert len(calls) == 1
+
+    with monkeypatch.context() as cache_hit_patch:
+        original_read_text = Path.read_text
+
+        def reject_source_read(path, *args, **kwargs):
+            if path == source:
+                raise AssertionError("compact cache hit reread the source transcript")
+            return original_read_text(path, *args, **kwargs)
+
+        cache_hit_patch.setattr(Path, "read_text", reject_source_read)
+        disk_cached = pm._cached_compact_transcript(
+            project_dir,
+            session,
+            source,
+            generated_at=4.0,
+        )
+
+    assert disk_cached == first.text
 
     write_saved_session(
         project_dir,
