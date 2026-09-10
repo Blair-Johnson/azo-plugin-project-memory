@@ -719,19 +719,15 @@ class ProjectMemoryStore:
                 if isinstance(raw, Mapping) and raw.get("kind") == "last_good_snapshot":
                     snapshot_present = True
                 continue
-            # Accept the pre-marker shape only as an in-place upgrade aid for
-            # local state created by this plugin before the per-record format.
-            candidates = raw.get("records", ()) if isinstance(raw, Mapping) and isinstance(raw.get("records"), list) else (raw,)
-            for candidate in candidates:
-                if not isinstance(candidate, Mapping):
-                    continue
-                try:
-                    record = self._normalize_record(candidate, fallback_id=str(key))
-                except (TypeError, ValueError):
-                    log.warning("Ignoring malformed durable project-memory snapshot record")
-                    continue
-                snapshot_present = True
-                snapshot[str(record["id"])] = record
+            if not isinstance(raw, Mapping):
+                continue
+            try:
+                record = self._normalize_record(raw, fallback_id=str(key))
+            except (TypeError, ValueError):
+                log.warning("Ignoring malformed durable project-memory snapshot record")
+                continue
+            snapshot_present = True
+            snapshot[str(record["id"])] = record
         for key, raw in local_store.items(self._PENDING_NAMESPACE):
             if not isinstance(raw, Mapping):
                 continue
