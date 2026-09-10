@@ -58,3 +58,25 @@ def test_ordinary_common_recall_remains_functional():
     store.list_all = lambda _: []
     pm.ProjectMemoryRecall(store)(s)
     assert s.project_memory_pending_recalls[0]["content"] == "Use the staging checklist."
+
+
+def test_initial_pending_snapshot_replays_trigger_without_new_message():
+    s = state()
+    s.entries = [message(0, "cobalt launch tonight")]
+    ready = False
+    memory = {"id": "mem_test", "content": "Require two reviewers.", "trigger": "cobalt launch"}
+    store = SimpleNamespace(
+        list_all=lambda _: [memory] if ready else [],
+        snapshot_status=lambda: {"ready": ready},
+        list_common=lambda **_: [],
+    )
+    recall = pm.ProjectMemoryRecall(store)
+    recall(s)
+    assert s.project_memory_pending_recalls == []
+    assert s.project_memory_deferred_events
+    ready = True
+    recall(s)
+    assert s.project_memory_pending_recalls == [{"id": "mem_test", "content": "Require two reviewers."}]
+    assert s.project_memory_deferred_events == []
+    recall(s)
+    assert len(s.project_memory_pending_recalls) == 1
