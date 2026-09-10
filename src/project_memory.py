@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import functools
 import hashlib
-import inspect
 import json
 import logging
 import operator
 import os
+import queue
 import re
 import secrets
 import sqlite3
-import tempfile
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,16 +35,11 @@ from agent_utils.components import (
     safe_interrupt_text,
 )
 from agent_utils.failed_tool_calls import FailedToolCallRecorder
-try:
-    from agent_utils.files.buffer_manager import (
-        BufferManager,
-        ReadonlyBufferView,
-        StateBoundSpecialBufferNamespaceProvider,
-    )
-except ImportError:  # pragma: no cover - compatibility error is raised at registration
-    from agent_utils.files.buffer_manager import BufferManager, ReadonlyBufferView
-
-    StateBoundSpecialBufferNamespaceProvider = None
+from agent_utils.files.buffer_manager import (
+    BufferManager,
+    ReadonlyBufferView,
+    StateBoundSpecialBufferNamespaceProvider,
+)
 from agents.system_prompt import SystemPromptSkillList
 from agent_zoo.tools.special_buffers import RegisterSpecialBuffers
 
@@ -88,7 +84,6 @@ MAX_BACKTEST_EXCERPT_CHARS = 600
 PROJECT_SESSIONS_BUFFER_ID = "project_sessions"
 SESSION_BUFFER_PREFIX = "ses_"
 MIN_SESSION_PREFIX_LENGTH = 8
-COMPACT_CACHE_VERSION = 3
 PROJECT_SESSION_RENDER_ATTR = "_project_session_memory_render"
 PROJECT_SESSION_INDEX_RENDER_ATTR = "_project_session_memory_index_render"
 CORE_SYSTEM_PROMPT = (
@@ -125,57 +120,9 @@ def _config_enabled(value: Any) -> bool:
 
 
 
-
-def _session_namespaces_supported() -> bool:
-    if StateBoundSpecialBufferNamespaceProvider is None:
-        return False
-    namespace_register = getattr(BufferManager, "register_special_buffer_namespace", None)
-    exact_register = getattr(BufferManager, "register_special_buffer", None)
-    if not callable(namespace_register) or not callable(exact_register):
-        return False
-    try:
-        return (
-            "replace" in inspect.signature(namespace_register).parameters
-            and "replace" in inspect.signature(exact_register).parameters
-        )
-    except (TypeError, ValueError):
-        return False
-
-
-
-
 def _register_exact_special_buffer(manager, buffer_id: str, provider: Any) -> None:
-    register = manager.register_special_buffer
-    try:
-        supports_replace = "replace" in inspect.signature(register).parameters
-    except (TypeError, ValueError):
-        supports_replace = False
-    if supports_replace:
-        register(buffer_id, provider, replace=True)
-        return
-    if manager.is_special(buffer_id):
-        providers = getattr(manager, "_special_buffers", None)
-        if isinstance(providers, dict):
-            providers[buffer_id] = provider
-            cache = getattr(manager, "_special_cache", None)
-            if isinstance(cache, dict):
-                cache.pop(buffer_id, None)
-            return
-    register(buffer_id, provider)
-
-
-_SESSION_NAMESPACE_WARNING_EMITTED = False
-
-
-def _warn_session_namespaces_unavailable() -> None:
-    global _SESSION_NAMESPACE_WARNING_EMITTED
-    if _SESSION_NAMESPACE_WARNING_EMITTED:
-        return
-    _SESSION_NAMESPACE_WARNING_EMITTED = True
-    log.warning(
-        "Project session buffers are disabled: the loaded Agent Utils build lacks "
-        "replaceable special-buffer namespace support. Core project-memory tools remain active."
-    )
+    """Replace one exact provider using the current BufferManager contract."""
+    manager.register_special_buffer(buffer_id, provider, replace=True)
 
 
 def _format_utc(value: Any) -> str:
@@ -210,6 +157,17 @@ def _session_key(session_id: str) -> str:
     return re.sub(r"[^0-9a-z]", "", str(session_id or "").lower())
 
 
+# These caps are deliberately small: session history is an observational aid,
+# not a second persistence system.  A single daemon drains the bounded queue.
+MAX_PROJECT_SESSION_ROWS = 1000
+SESSION_LOAD_QUEUE_LIMIT = 8
+SESSION_PROJECTION_CACHE_LIMIT = 16
+SESSION_BUFFER_RECORD_LIMIT = 32
+SESSION_ERROR_CHARS = 300
+SESSION_INDEX_REFRESH_S = 5.0
+SESSION_LOAD_RETRY_S = 5.0
+
+
 def _session_buffer_ids(sessions: Sequence[Mapping[str, Any]]) -> dict[str, str]:
     keyed = {
         str(item.get("session_id") or ""): _session_key(str(item.get("session_id") or ""))
@@ -229,26 +187,18 @@ def _session_buffer_ids(sessions: Sequence[Mapping[str, Any]]) -> dict[str, str]
     return result
 
 
-def _load_session_index(path: Path) -> list[dict[str, Any]]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    if not isinstance(data, list):
-        return []
-    return [dict(item) for item in data if isinstance(item, Mapping)]
-
-
 def _session_source(project_dir: Path, session_id: str) -> Path:
-    if not session_id or Path(session_id).name != session_id or session_id in {".", ".."}:
+    """Return the logical checkpoint locator without touching shared storage."""
+    if (
+        not session_id
+        or "\x00" in session_id
+        or Path(session_id).name != session_id
+        or session_id in {".", ".."}
+    ):
         raise ValueError(f"Invalid session id: {session_id!r}")
-    sessions_root = (project_dir / "sessions").resolve()
-    source = (sessions_root / session_id / "session.json").resolve()
-    try:
-        source.relative_to(sessions_root)
-    except ValueError as exc:
-        raise ValueError(f"Session path escapes project: {session_id!r}") from exc
-    return source
+    # ``abspath`` is lexical here; unlike ``resolve`` it does not inspect a
+    # shared mount or follow a session directory while the pipeline is running.
+    return Path(os.path.abspath(os.fspath(Path(project_dir) / "sessions" / session_id / "session.json")))
 
 
 def _timestamp_sort_value(value: Any) -> float:
@@ -271,36 +221,39 @@ def _timestamp_sort_value(value: Any) -> float:
 
 
 def _eligible_project_sessions(
-    project_dir: Path,
+    entries: Sequence[Mapping[str, Any]],
     current_session_id: str,
 ) -> list[dict[str, Any]]:
-    sessions = []
+    """Filter only catalog metadata; never probe one shared row at a time."""
+    sessions: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in _load_session_index(project_dir / "sessions" / "index.json"):
+    current = str(current_session_id or "").strip()
+    for raw in entries:
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
         session_id = str(item.get("session_id") or "").strip()
         kind = str(item.get("kind") or "").strip().lower()
         if (
             not session_id
+            or "\x00" in session_id
+            or Path(session_id).name != session_id
             or session_id in seen
-            or session_id == current_session_id
+            or session_id == current
             or kind.startswith("rlm")
         ):
             continue
-        seen.add(session_id)
-        try:
-            source = _session_source(project_dir, session_id)
-        except ValueError:
-            continue
-        if not source.is_file():
-            continue
         item["session_id"] = session_id
-        item["source_transcript"] = str(source)
+        # Old rows may contain a mutable source path.  It is not inventory
+        # metadata and must never become the authority for a history buffer.
+        item.pop("source_transcript", None)
+        seen.add(session_id)
         sessions.append(item)
     sessions.sort(
-        key=lambda item: _timestamp_sort_value(item.get("updated_at")),
+        key=lambda item: (_timestamp_sort_value(item.get("updated_at")), str(item["session_id"])),
         reverse=True,
     )
-    return sessions
+    return sessions[:MAX_PROJECT_SESSION_ROWS]
 
 
 def _content_text(value: Any) -> str:
@@ -349,33 +302,8 @@ def _entry_line_ranges(source_text: str) -> dict[int, tuple[int, int]]:
     return ranges
 
 
-def _entry_has_tool_activity(entry: Mapping[str, Any]) -> bool:
-    if entry.get("tool_calls"):
-        return True
-    for message in entry.get("messages") or []:
-        if not isinstance(message, Mapping):
-            continue
-        if str(message.get("role") or "") == "tool":
-            return True
-        if message.get("tool_calls") or message.get("provider_tool_calls"):
-            return True
-    return False
-
-
-def _role_text(entry: Mapping[str, Any], role: str) -> str:
-    parts = []
-    for message in entry.get("messages") or []:
-        if not isinstance(message, Mapping):
-            continue
-        if str(message.get("role") or "") != role:
-            continue
-        text = _content_text(message.get("content")).strip()
-        if text:
-            parts.append(text)
-    return "\n\n".join(parts)
-
-
 def _compact_turns(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Keep complete user/final-assistant turn blocks, oldest-to-newest."""
     turns: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     for position, entry in enumerate(entries):
@@ -416,6 +344,8 @@ def _compact_turns(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
             )
             if has_message_tool_calls or only_assistant_owns_entry_calls:
                 continue
+            # Later plain assistant messages in the same turn are the final
+            # answer for projection purposes.
             current["assistant_entry"] = entry_index
             current["assistant_text"] = text
     if current is not None:
@@ -434,9 +364,11 @@ def _build_compact_transcript(
     session: Mapping[str, Any],
     source: Path,
     *,
+    revision_id: str = "",
     generated_at: float,
     source_text: str | None = None,
 ) -> str:
+    """Build a projection from an AU-validated immutable payload."""
     if source_text is None:
         source_text = source.read_text(encoding="utf-8")
     document = json.loads(source_text)
@@ -454,7 +386,8 @@ def _build_compact_transcript(
         f"Updated (UTC): {_format_utc(session.get('updated_at'))}",
         f"Buffer Generated (UTC): {_format_utc(generated_at)}",
         "Order: Newest turn first",
-        f"Source Transcript: {source.resolve()}",
+        f"Source Transcript: {source}",
+        f"Source Revision: {revision_id or '(unknown immutable revision)'}",
     ]
     for turn in reversed(_compact_turns(entries)):
         lines.extend(
@@ -475,124 +408,23 @@ def _build_compact_transcript(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _cache_path(project_dir: Path, session_id: str) -> Path:
-    raw_id = str(session_id or "")
-    readable = _session_key(raw_id)[:24] or "session"
-    digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:12]
-    return (
-        project_dir
-        / "plugin-data"
-        / "project-memory"
-        / "compact"
-        / f"{readable}-{digest}.json"
-    )
-
-
-def _source_stat_key(source_stat: os.stat_result) -> tuple[int, int, int, int]:
-    return (
-        source_stat.st_dev,
-        source_stat.st_ino,
-        source_stat.st_size,
-        source_stat.st_mtime_ns,
-    )
-
-
-def _read_source_snapshot(source: Path) -> tuple[str, os.stat_result]:
-    for _ in range(3):
-        before = source.stat()
-        source_text = source.read_text(encoding="utf-8")
-        after = source.stat()
-        if _source_stat_key(before) == _source_stat_key(after):
-            return source_text, after
-    raise OSError(f"Session transcript changed repeatedly while reading: {source}")
-
-
-def _session_cache_metadata(
-    session: Mapping[str, Any],
-    source: Path,
-    source_stat: os.stat_result,
-) -> dict[str, Any]:
-    return {
-        "version": COMPACT_CACHE_VERSION,
-        "source": str(source.resolve()),
-        "source_device": source_stat.st_dev,
-        "source_inode": source_stat.st_ino,
-        "source_size": source_stat.st_size,
-        "source_mtime_ns": source_stat.st_mtime_ns,
-        "title": str(session.get("title") or ""),
-        "description": str(session.get("description") or ""),
-        "created_at": session.get("created_at"),
-        "updated_at": session.get("updated_at"),
+def _projection_cache_key(session: Mapping[str, Any], revision_id: str) -> tuple[str, str, str]:
+    metadata = {
+        key: session.get(key)
+        for key in ("title", "description", "created_at", "updated_at", "kind")
     }
-
-
-def _read_compact_cache(path: Path, expected: Mapping[str, Any]) -> str | None:
-    try:
-        cached = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(cached, Mapping) or cached.get("metadata") != dict(expected):
-        return None
-    text = cached.get("text")
-    return text if isinstance(text, str) else None
-
-
-def _atomic_write_cache(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temp_path = Path(handle.name)
-            json.dump(payload, handle, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    finally:
-        if temp_path is not None:
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
-
-
-def _cached_compact_transcript(
-    project_dir: Path,
-    session: Mapping[str, Any],
-    source: Path,
-    *,
-    generated_at: float,
-) -> str:
-    cache = _cache_path(project_dir, str(session["session_id"]))
-    before = source.stat()
-    cached = _read_compact_cache(
-        cache,
-        _session_cache_metadata(session, source, before),
+    return (
+        str(session.get("session_id") or ""),
+        str(revision_id or ""),
+        json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str),
     )
-    after = source.stat()
-    if cached is not None and _source_stat_key(before) == _source_stat_key(after):
-        return cached
 
-    source_text, source_stat = _read_source_snapshot(source)
-    metadata = _session_cache_metadata(session, source, source_stat)
-    text = _build_compact_transcript(
-        session,
-        source,
-        generated_at=generated_at,
-        source_text=source_text,
-    )
-    try:
-        _atomic_write_cache(cache, {"metadata": metadata, "text": text})
-    except OSError:
-        log.debug("Could not cache compact session transcript %s", source, exc_info=True)
-    return text
+
+def _bounded_history_error(error: object) -> str:
+    text = str(error or "").replace("\x00", " ").strip()
+    if len(text) > SESSION_ERROR_CHARS:
+        return text[:SESSION_ERROR_CHARS].rstrip() + "…"
+    return text or "unknown history read failure"
 
 
 class ProjectMemoryStore:
@@ -916,16 +748,26 @@ class ProjectMemoryBuffer:
 
 
 class ProjectSessionBuffers:
-    """Expose previous project sessions as compact readonly buffers."""
+    """Expose previous project sessions through immutable revision projections."""
 
     reads = {"buffer_manager"}
-    optional_reads = {"_agent_zoo_context", "_session_id", "run_db", "agent_db"}
+    optional_reads = {"_agent_zoo_context", "_session_id", "_local_state_root", "run_db", "agent_db"}
     writes = {"buffer_manager"}
 
     def __init__(self, *, clock=time.time) -> None:
         self.clock = clock
         self._project_name = ""
         self._session_id = ""
+        self._lock = threading.RLock()
+        self._work: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(
+            maxsize=SESSION_LOAD_QUEUE_LIMIT
+        )
+        self._worker: threading.Thread | None = None
+        self._inventories: dict[str, dict[str, Any]] = {}
+        self._buffer_records: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._session_results: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._pinned_revisions: dict[tuple[str, str], dict[str, str]] = {}
+        self._projection_cache: OrderedDict[tuple[str, str, str], str] = OrderedDict()
 
     def bind_session(
         self,
@@ -939,19 +781,184 @@ class ProjectSessionBuffers:
         if project_name is not None:
             self._project_name = str(project_name or "default")
 
-    def __call__(self, state):
-        if not _session_namespaces_supported():
-            log.warning(
-                "Project session buffers are unavailable because this Agent Utils "
-                "build lacks special-buffer namespace support"
+    def _project_key(self, project_name: str, project_dir: Path) -> str:
+        return f"{project_name}\x00{os.path.abspath(os.fspath(project_dir))}"
+
+    @staticmethod
+    def _session_scope_key(project_key: str, buffer_id: str) -> tuple[str, str]:
+        return project_key, str(buffer_id)
+
+    def _ensure_worker(self) -> None:
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._worker_loop,
+                name="azo-project-session-history",
+                daemon=True,
             )
-            return state
+            self._worker = worker
+            worker.start()
+
+    def _enqueue(self, kind: str, payload: dict[str, Any]) -> bool:
+        self._ensure_worker()
+        try:
+            self._work.put_nowait((kind, payload))
+        except queue.Full:
+            return False
+        return True
+
+    def _worker_loop(self) -> None:
+        while True:
+            kind, payload = self._work.get()
+            try:
+                if kind == "inventory":
+                    self._read_inventory(payload)
+                elif kind == "session":
+                    self._read_session(payload)
+                else:  # pragma: no cover - defensive queue integrity guard
+                    log.warning("Unknown project-session history task %r", kind)
+            except Exception:
+                log.debug("Project-session history task failed", exc_info=True)
+            finally:
+                self._work.task_done()
+
+    def _new_inventory(self) -> dict[str, Any]:
+        return {
+            "status": "pending",
+            "sessions": [],
+            "error": "initial metadata read is pending",
+            "pending": False,
+            "has_snapshot": False,
+            "requested_at": 0.0,
+            "completed_at": 0.0,
+        }
+
+    def _inventory_snapshot(self, key: str) -> dict[str, Any]:
+        with self._lock:
+            record = self._inventories.get(key)
+            if record is None:
+                record = self._new_inventory()
+                self._inventories[key] = record
+            return {
+                **record,
+                "sessions": [dict(item) for item in record.get("sessions", [])],
+            }
+
+    def _request_inventory(
+        self,
+        project_name: str,
+        project_dir: Path,
+        current_session_id: str,
+    ) -> str:
+        key = self._project_key(project_name, project_dir)
+        now = float(self.clock())
+        with self._lock:
+            record = self._inventories.setdefault(key, self._new_inventory())
+            if record.get("pending"):
+                return key
+            requested_at = float(record.get("requested_at") or 0.0)
+            if record.get("has_snapshot") and now - requested_at < SESSION_INDEX_REFRESH_S:
+                return key
+            record["pending"] = True
+            record["requested_at"] = now
+            if not record.get("has_snapshot"):
+                record["status"] = "pending"
+                record["error"] = "initial metadata read is pending"
+
+        payload = {
+            "key": key,
+            "project_name": project_name,
+            "project_dir": project_dir,
+            "current_session_id": current_session_id,
+        }
+        if self._enqueue("inventory", payload):
+            return key
+        with self._lock:
+            record = self._inventories[key]
+            record["pending"] = False
+            record["status"] = "unavailable"
+            record["error"] = "background history queue is full"
+        return key
+
+    @staticmethod
+    def _read_catalog_snapshot(project_name: str, project_dir: Path):
+        from agent_zoo import projects
+
+        catalog_path = Path(
+            os.path.abspath(os.fspath(Path(project_dir) / "sessions" / "index.json"))
+        )
+        data = projects._read_observational_json(catalog_path)
+        if data is projects._MISSING_DOCUMENT:
+            return projects.SessionIndexSnapshot(project_name, catalog_path, [], "absent")
+        return projects.SessionIndexSnapshot(
+            project_name,
+            catalog_path,
+            projects._validate_session_index(data, catalog_path),
+            "present",
+        )
+
+    def _read_inventory(self, payload: Mapping[str, Any]) -> None:
+        key = str(payload["key"])
+        project_name = str(payload["project_name"])
+        project_dir = Path(payload["project_dir"])
+        current_session_id = str(payload.get("current_session_id") or "")
+        try:
+            # This is the one atomic catalog read.  It deliberately does not
+            # inspect a session directory or checkpoint row for each entry.
+            snapshot = self._read_catalog_snapshot(project_name, project_dir)
+            sessions = _eligible_project_sessions(snapshot.entries, current_session_id)
+            status = "absent" if snapshot.absent else "ready"
+            error = "session catalog is absent" if snapshot.absent else ""
+        except Exception as exc:
+            with self._lock:
+                record = self._inventories.setdefault(key, self._new_inventory())
+                record["pending"] = False
+                record["status"] = "unavailable"
+                record["error"] = _bounded_history_error(exc)
+                record["completed_at"] = float(self.clock())
+            return
+
+        with self._lock:
+            record = self._inventories.setdefault(key, self._new_inventory())
+            record["pending"] = False
+            record["status"] = status
+            record["error"] = error
+            record["sessions"] = [dict(item) for item in sessions]
+            record["has_snapshot"] = True
+            record["completed_at"] = float(self.clock())
+            buffer_ids = _session_buffer_ids(sessions)
+            for session in sessions:
+                session_id = str(session["session_id"])
+                buffer_id = buffer_ids.get(session_id)
+                if not buffer_id:
+                    continue
+                self._buffer_records[buffer_id] = {
+                    "project_key": key,
+                    "session": dict(session),
+                }
+                self._buffer_records.move_to_end(buffer_id)
+            while len(self._buffer_records) > SESSION_BUFFER_RECORD_LIMIT:
+                self._buffer_records.popitem(last=False)
+
+    def _local_state_root(self, state: Any, context: Mapping[str, Any]) -> str | None:
+        value = (
+            context.get("local_state_root")
+            or getattr(state, "_local_state_root", "")
+            or getattr(state, "local_state_root", "")
+        )
+        text = str(value or "").strip()
+        return text or None
+
+    def __call__(self, state):
         manager = state.buffer_manager
         context = dict(getattr(state, "_agent_zoo_context", {}) or {})
-        if not self._project_name:
-            self._project_name = str(context.get("project_name") or "")
-        if not self._session_id:
-            self._session_id = str(getattr(state, "_session_id", "") or "")
+        context_project_name = str(context.get("project_name") or "").strip()
+        if context_project_name:
+            self._project_name = context_project_name
+        context_session_id = str(getattr(state, "_session_id", "") or context.get("session_id") or "").strip()
+        if context_session_id:
+            self._session_id = context_session_id
 
         setattr(state, PROJECT_SESSION_INDEX_RENDER_ATTR, functools.partial(self.render_index, state))
         setattr(state, PROJECT_SESSION_RENDER_ATTR, functools.partial(self.render_session, state))
@@ -965,9 +972,12 @@ class ProjectSessionBuffers:
             StateBoundSpecialBufferNamespaceProvider(PROJECT_SESSION_RENDER_ATTR),
             replace=True,
         )
+        project_name, project_dir, current_session_id = self._runtime_context(state)
+        if project_dir is not None:
+            self._request_inventory(project_name, project_dir, current_session_id)
         return state
 
-    def _runtime_context(self, state) -> tuple[str, Path, str]:
+    def _runtime_context(self, state) -> tuple[str, Path | None, str]:
         context = dict(getattr(state, "_agent_zoo_context", {}) or {})
         project_name = self._project_name or str(context.get("project_name") or "default")
         current_session_id = str(
@@ -988,13 +998,44 @@ class ProjectSessionBuffers:
                 agent_db = getattr(run_db, "agent_db", None) or getattr(state, "agent_db", None)
                 db_path = str(getattr(agent_db, "path", "") or "").strip()
                 if not db_path:
-                    raise RuntimeError("Agent Zoo project directory is unavailable")
+                    return project_name, None, current_session_id
                 project_dir = Path(db_path).parent
         return project_name, project_dir, current_session_id
 
+    @staticmethod
+    def _inventory_status_lines(record: Mapping[str, Any]) -> list[str]:
+        status = str(record.get("status") or "pending")
+        sessions = list(record.get("sessions", []) or [])
+        if status == "pending":
+            if sessions:
+                return ["Inventory: refresh pending; showing the last good metadata snapshot."]
+            return ["Inventory: pending; initial metadata read is still in progress."]
+        if status == "unavailable":
+            detail = _bounded_history_error(record.get("error"))
+            if sessions:
+                return [
+                    f"Inventory: unavailable ({detail}); showing the last good metadata snapshot."
+                ]
+            return [f"Inventory: unavailable ({detail})."]
+        if status == "absent":
+            return ["Inventory: absent; no published session catalog is available."]
+        return ["Inventory: ready."]
+
     def render_index(self, state) -> ReadonlyBufferView:
         project_name, project_dir, current_session_id = self._runtime_context(state)
-        sessions = _eligible_project_sessions(project_dir, current_session_id)
+        if project_dir is None:
+            return ReadonlyBufferView(
+                id=PROJECT_SESSIONS_BUFFER_ID,
+                path="project-memory://sessions/pending",
+                text=(
+                    "Project Sessions\n"
+                    f"Project: {project_name}\n"
+                    "Inventory: pending; Agent Zoo project context is not attached yet.\n"
+                ),
+            )
+        key = self._request_inventory(project_name, project_dir, current_session_id)
+        record = self._inventory_snapshot(key)
+        sessions = record["sessions"]
         buffer_ids = _session_buffer_ids(sessions)
         lines = [
             "Project Sessions",
@@ -1002,6 +1043,7 @@ class ProjectSessionBuffers:
             f"Buffer Generated (UTC): {_format_utc(self.clock())}",
             "Order: Updated (UTC), newest first",
             "Current session omitted; RLM sessions excluded.",
+            *self._inventory_status_lines(record),
             f"Sessions: {len(buffer_ids)}",
         ]
         listed = 0
@@ -1031,12 +1073,214 @@ class ProjectSessionBuffers:
             text="\n".join(lines).rstrip() + "\n",
         )
 
+    @staticmethod
+    def _status_view(buffer_id: str, status: str, detail: str) -> ReadonlyBufferView:
+        label = "pending" if status == "pending" else "unavailable"
+        return ReadonlyBufferView(
+            id=buffer_id,
+            path=f"project-memory://sessions/{buffer_id}/{label}",
+            text=(
+                f"Session buffer {buffer_id}: {label}.\n"
+                f"{detail}\n"
+            ),
+        )
+
+    def _queue_session_load(
+        self,
+        *,
+        project_key: str,
+        project_name: str,
+        project_dir: Path,
+        buffer_id: str,
+        session: Mapping[str, Any],
+        local_state_root: str | None,
+        revision_id: str | None,
+    ) -> bool:
+        session_id = str(session["session_id"])
+        scope_key = self._session_scope_key(project_key, buffer_id)
+        now = float(self.clock())
+        with self._lock:
+            binding = self._pinned_revisions.get(scope_key)
+            if binding is not None:
+                if binding["session_id"] != session_id:
+                    self._session_results[scope_key] = {
+                        "status": "unavailable",
+                        "error": (
+                            f"buffer is pinned to session {binding['session_id']}; "
+                            f"catalog now maps it to {session_id}"
+                        ),
+                        "project_key": project_key,
+                        "session_id": binding["session_id"],
+                        "retry_at": None,
+                    }
+                    return False
+                revision_id = binding["revision_id"]
+            elif revision_id is None and len(self._pinned_revisions) >= SESSION_BUFFER_RECORD_LIMIT:
+                self._session_results[scope_key] = {
+                    "status": "unavailable",
+                    "error": "session history pin capacity reached; refusing to retarget a buffer",
+                    "project_key": project_key,
+                    "session_id": session_id,
+                    "retry_at": None,
+                }
+                return False
+            self._session_results[scope_key] = {
+                "status": "pending",
+                "requested_at": now,
+                "project_key": project_key,
+                "session_id": session_id,
+            }
+            self._session_results.move_to_end(scope_key)
+        payload = {
+            "project_key": project_key,
+            "project_name": project_name,
+            "project_dir": project_dir,
+            "buffer_id": buffer_id,
+            "session": dict(session),
+            "local_state_root": local_state_root,
+            "revision_id": revision_id,
+        }
+        if self._enqueue("session", payload):
+            return True
+        with self._lock:
+            self._session_results[scope_key] = {
+                "status": "unavailable",
+                "error": "background history queue is full",
+                "project_key": project_key,
+                "session_id": session_id,
+                "retry_at": now + SESSION_LOAD_RETRY_S,
+            }
+        return False
+
+    def _read_session(self, payload: Mapping[str, Any]) -> None:
+        project_key = str(payload["project_key"])
+        buffer_id = str(payload["buffer_id"])
+        scope_key = self._session_scope_key(project_key, buffer_id)
+        session = dict(payload["session"])
+        session_id = str(session["session_id"])
+        revision_id = str(payload.get("revision_id") or "").strip() or None
+        try:
+            from agent_zoo.checkpoint_sync import PendingCheckpointLoad, load_checkpoint
+
+            locator = _session_source(Path(payload["project_dir"]), session_id)
+            loaded = load_checkpoint(
+                locator,
+                session_id=session_id,
+                revision_id=revision_id,
+                local_state_root=payload.get("local_state_root"),
+                # The worker owns the wait.  A zero observer budget prevents a
+                # caller-facing view from blocking on shared storage.
+                shared_timeout_s=0.0,
+            )
+            if isinstance(loaded, PendingCheckpointLoad):
+                loaded = loaded.wait(timeout_s=None)
+            loaded_revision = getattr(loaded, "revision", None)
+            actual_revision_id = str(getattr(loaded_revision, "revision_id", "") or "").strip()
+            payload_path = Path(getattr(loaded, "payload_path", ""))
+            if not actual_revision_id or not payload_path.name:
+                raise RuntimeError("checkpoint loader returned no immutable revision payload")
+            if revision_id is not None and actual_revision_id != revision_id:
+                raise RuntimeError(
+                    f"checkpoint loader selected revision {actual_revision_id!r}, expected {revision_id!r}"
+                )
+
+            cache_key = _projection_cache_key(session, actual_revision_id)
+            with self._lock:
+                text = self._projection_cache.get(cache_key)
+                if text is not None:
+                    self._projection_cache.move_to_end(cache_key)
+            if text is None:
+                # load_checkpoint has already run the real AU revision validator,
+                # including session.json/blob references.  This read is only the
+                # immutable payload used for the compact projection.
+                source_text = payload_path.read_text(encoding="utf-8")
+                text = _build_compact_transcript(
+                    session,
+                    payload_path,
+                    revision_id=actual_revision_id,
+                    generated_at=self.clock(),
+                    source_text=source_text,
+                )
+                with self._lock:
+                    self._projection_cache[cache_key] = text
+                    self._projection_cache.move_to_end(cache_key)
+                    while len(self._projection_cache) > SESSION_PROJECTION_CACHE_LIMIT:
+                        self._projection_cache.popitem(last=False)
+
+            with self._lock:
+                binding = self._pinned_revisions.get(scope_key)
+                if binding is not None:
+                    if binding["session_id"] != session_id:
+                        raise RuntimeError(
+                            f"buffer is pinned to session {binding['session_id']}; "
+                            f"loaded {session_id} instead"
+                        )
+                    if binding["revision_id"] != actual_revision_id:
+                        raise RuntimeError(
+                            f"buffer is pinned to revision {binding['revision_id']}; "
+                            f"loaded {actual_revision_id} instead"
+                        )
+                else:
+                    if len(self._pinned_revisions) >= SESSION_BUFFER_RECORD_LIMIT:
+                        raise RuntimeError(
+                            "session history pin capacity reached; refusing to retarget a buffer"
+                        )
+                    self._pinned_revisions[scope_key] = {
+                        "revision_id": actual_revision_id,
+                        "session_id": session_id,
+                    }
+                self._session_results[scope_key] = {
+                    "status": "ready",
+                    "text": text,
+                    "revision_id": actual_revision_id,
+                    "project_key": project_key,
+                    "session_id": session_id,
+                    "cache_key": cache_key,
+                }
+                self._session_results.move_to_end(scope_key)
+                while len(self._session_results) > SESSION_BUFFER_RECORD_LIMIT:
+                    evictable = next(
+                        (
+                            key
+                            for key in self._session_results
+                            if key not in self._pinned_revisions
+                        ),
+                        None,
+                    )
+                    if evictable is None:
+                        break
+                    self._session_results.pop(evictable, None)
+        except Exception as exc:
+            error = _bounded_history_error(exc)
+            retry_at = (
+                None
+                if "pin capacity" in error or "buffer is pinned" in error
+                else float(self.clock()) + SESSION_LOAD_RETRY_S
+            )
+            with self._lock:
+                self._session_results[scope_key] = {
+                    "status": "unavailable",
+                    "error": error,
+                    "project_key": project_key,
+                    "session_id": session_id,
+                    "retry_at": retry_at,
+                }
+                self._session_results.move_to_end(scope_key)
+
     def render_session(self, state, buffer_id: str) -> ReadonlyBufferView | None:
         requested = str(buffer_id or "").strip().lower()
         if not re.fullmatch(r"ses_[0-9a-z]{8,}", requested):
             return None
-        _, project_dir, current_session_id = self._runtime_context(state)
-        sessions = _eligible_project_sessions(project_dir, current_session_id)
+        project_name, project_dir, current_session_id = self._runtime_context(state)
+        if project_dir is None:
+            return self._status_view(
+                requested,
+                "pending",
+                "Agent Zoo project context is not attached yet; retry this buffer after startup.",
+            )
+        project_key = self._request_inventory(project_name, project_dir, current_session_id)
+        record = self._inventory_snapshot(project_key)
+        sessions = record["sessions"]
         buffer_ids = _session_buffer_ids(sessions)
         session = next(
             (
@@ -1047,19 +1291,97 @@ class ProjectSessionBuffers:
             None,
         )
         if session is None:
+            with self._lock:
+                remembered = self._buffer_records.get(requested)
+                if remembered is not None and remembered.get("project_key") == project_key:
+                    session = dict(remembered.get("session") or {})
+                    self._buffer_records.move_to_end(requested)
+        if session is None:
+            if record["status"] in {"pending", "unavailable"}:
+                detail = (
+                    "The metadata inventory has not completed yet. Re-read this buffer shortly."
+                    if record["status"] == "pending"
+                    else f"The metadata inventory failed: {_bounded_history_error(record.get('error'))}"
+                )
+                return self._status_view(requested, record["status"], detail)
             return None
-        session_id = str(session["session_id"])
-        source = Path(str(session["source_transcript"]))
-        text = _cached_compact_transcript(
-            project_dir,
-            session,
-            source,
-            generated_at=self.clock(),
+
+        scope_key = self._session_scope_key(project_key, requested)
+        pinned = None
+        binding = None
+        result = None
+        with self._lock:
+            binding = self._pinned_revisions.get(scope_key)
+            result = self._session_results.get(scope_key)
+            if binding is not None:
+                pinned = binding["revision_id"]
+                if binding["session_id"] != str(session["session_id"]):
+                    return self._status_view(
+                        requested,
+                        "unavailable",
+                        (
+                            f"This buffer is pinned to session {binding['session_id']}; "
+                            f"the catalog now maps it to {session['session_id']}."
+                        ),
+                    )
+        if isinstance(result, Mapping) and result.get("status") == "ready":
+            if (
+                result.get("project_key") == project_key
+                and result.get("session_id") == str(session["session_id"])
+            ):
+                return ReadonlyBufferView(
+                    id=requested,
+                    path=(
+                        f"project-memory://sessions/{session['session_id']}"
+                        f"/revisions/{result['revision_id']}"
+                    ),
+                    # Do not rebuild headers from a newer catalog row: a pinned
+                    # projection is the exact text first returned to the caller.
+                    text=str(result["text"]),
+                )
+        if isinstance(result, Mapping) and result.get("status") == "pending":
+            return self._status_view(
+                requested,
+                "pending",
+                "The immutable revision is loading in the bounded background worker.",
+            )
+        if isinstance(result, Mapping) and result.get("status") == "unavailable":
+            error = _bounded_history_error(result.get("error"))
+            retry_at = result.get("retry_at")
+            if "pin capacity" in error or "buffer is pinned" in error:
+                return self._status_view(requested, "unavailable", error)
+            if retry_at is not None and float(self.clock()) < float(retry_at):
+                return self._status_view(
+                    requested,
+                    "unavailable",
+                    f"The immutable revision could not be loaded: {error}",
+                )
+
+        queued = self._queue_session_load(
+            project_key=project_key,
+            project_name=project_name,
+            project_dir=project_dir,
+            buffer_id=requested,
+            session=session,
+            local_state_root=self._local_state_root(
+                state,
+                dict(getattr(state, "_agent_zoo_context", {}) or {}),
+            ),
+            revision_id=pinned,
         )
-        return ReadonlyBufferView(
-            id=requested,
-            path=f"project-memory://sessions/{session_id}",
-            text=text,
+        if not queued:
+            with self._lock:
+                failed = self._session_results.get(scope_key)
+            if isinstance(failed, Mapping) and failed.get("status") == "unavailable":
+                return self._status_view(
+                    requested,
+                    "unavailable",
+                    _bounded_history_error(failed.get("error")),
+                )
+        return self._status_view(
+            requested,
+            "pending",
+            "The immutable preferred revision is queued for local-first loading.",
         )
 
 
@@ -1846,9 +2168,7 @@ def register_features(builder, *, session, config):
         )
     else:
         sessions_requested = ProjectMemorySystemPrompt.enabled(session_config)
-    sessions_enabled = sessions_requested and _session_namespaces_supported()
-    if sessions_requested and not sessions_enabled:
-        _warn_session_namespaces_unavailable()
+    sessions_enabled = sessions_requested
 
     prompt = str(section.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
     if not sessions_enabled:
