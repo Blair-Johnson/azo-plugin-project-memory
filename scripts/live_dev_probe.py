@@ -116,6 +116,16 @@ async def exercise(args, command, env, clients, project):
     text = await turn(recovered, 'Use view(buffer="project_memory"). If sharing is still pending, retry. '
         'Confirm that the deleted memory is absent and report synchronization status.', "MEMORY_RECOVERED")
     assert "## " + memory_id not in results(recovered, "view")[-1], "Deleted memory reappeared"
+    from tmux_pilot.fs_store import RecordStore
+    shared = RecordStore(args.dev_root / "projects" / project / "plugin-data/project-memory", create=False)
+    deadline = time.monotonic() + 30
+    while True:
+        record = shared.get("project_memory", memory_id)
+        if record and record.get("deleted"):
+            break
+        assert time.monotonic() < deadline, "Offline deletion was not published after recovery"
+        await asyncio.sleep(0.1)
+    emit("shared_delete_verified", memory_id=memory_id, revision=record["revision"])
     await asyncio.wait_for(recovered.close(), 60)
     emit("passed", project=project, memory_id=memory_id, restarted_session=first_id)
 
