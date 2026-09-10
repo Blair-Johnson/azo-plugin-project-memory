@@ -60,6 +60,7 @@ SEEN_EVENTS_ATTR = "project_memory_seen_events"
 PENDING_RECALLS_ATTR = "project_memory_pending_recalls"
 BOOTSTRAPPED_ATTR = "project_memory_scan_bootstrapped"
 LAST_ENTRY_COUNT_ATTR = "project_memory_last_entry_count"
+DEFERRED_EVENTS_ATTR = "project_memory_deferred_events"
 MAX_SEEN_EVENTS = 4096
 REGEX_SECONDS = 0.005
 RECALL_SECONDS = 0.05
@@ -1271,6 +1272,7 @@ class ProjectMemoryRecall:
         SUPPRESSIONS_ATTR,
         BOOTSTRAPPED_ATTR,
         LAST_ENTRY_COUNT_ATTR,
+        DEFERRED_EVENTS_ATTR,
     }
     init = {
         SEEN_EVENTS_ATTR: list,
@@ -1278,6 +1280,7 @@ class ProjectMemoryRecall:
         SUPPRESSIONS_ATTR: dict,
         BOOTSTRAPPED_ATTR: bool,
         LAST_ENTRY_COUNT_ATTR: int,
+        DEFERRED_EVENTS_ATTR: list,
     }
 
     def __init__(self, store: ProjectMemoryStore) -> None:
@@ -1294,13 +1297,18 @@ class ProjectMemoryRecall:
             self._new_events(state, entries, baseline_only=True)
             return state
         events = self._new_events(state, entries)
-        if not events:
-            return state
+        deferred = getattr(state, DEFERRED_EVENTS_ATTR, [])
+        events = list(dict((str(key), str(text)[:MAX_MATCH_TEXT])
+                           for key, text in [*deferred, *events]).items())[-32:]
         try:
             memories = self.store.list_all(state)
+            snapshot_ready = self.store.snapshot_status()["ready"]
         except Exception:
-            log.debug("project memory database unavailable during recall", exc_info=True)
-            memories = []
+            log.debug("project memory snapshot unavailable during recall", exc_info=True)
+            memories, snapshot_ready = [], False
+        setattr(state, DEFERRED_EVENTS_ATTR, [] if snapshot_ready else events)
+        if not events:
+            return state
         memories.extend(self.store.list_common(enabled_only=True))
         if not memories:
             return state

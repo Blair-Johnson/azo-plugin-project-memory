@@ -1,33 +1,38 @@
-# azo-plugin-project-memory
+# Project memory for Agent Zoo
 
-An Agent Zoo userspace plugin for project-scoped, agent-authored regex memories.
+This branch targets the current filesystem lifecycle harness. It keeps the `record_memory`, `update_memory`, `suppress_memory`, and `delete_memory` tools, regex-triggered recall, and the `project_memory`, `project_sessions`, and `ses_…` readonly buffers. It does not use the old AgentDB SQLite connection or require an orchestrator.
 
-The plugin stores memories in the current Agent Zoo project's shared SQLite database. Each memory has a short `mem_xxxxxx` identifier, content to recall, and a regular-expression trigger. On every pipeline pass, after tool results have been consolidated, the plugin tests newly appended transcript messages against current project memories. A matching memory is delivered as a standard interrupt only when its content is not already present in the active context after the newest harness handoff or provider compaction boundary.
+## Behavior
 
-The feature provides `record_memory`, `update_memory`, `suppress_memory`, and `delete_memory`. Suppression is session-local and measured in pipeline turns; memory records themselves propagate between running sessions because the database is queried on every pass.
+Project memories are independent records. Explicit writes are saved locally before being queued for publication to shared storage. Tool receipts distinguish local persistence from shared publication. Concurrent edits are checked against their expected revisions rather than silently overwriting another writer. Configured memories remain readonly; suppression remains session-local.
 
-The plugin registers three readonly buffer surfaces. `project_memory` shows the project’s regex memories. `project_sessions` lists saved previous sessions newest-first, excluding the active session and every RLM session. Each listed `ses_<prefix>` ID lazily renders a compact reverse-chronological projection: complete turn blocks appear newest-first while each block preserves the user message followed by its final assistant response. Message delimiters retain source entry indexes and line ranges into the authoritative `session.json` file.
+Recall uses an in-memory last-good memory snapshot while a background worker refreshes it. Shared storage errors are not interpreted as an empty memory collection. Routine synchronization is quiet; inspect `project_memory` for status. Local-only changes are not available on other hosts until publication succeeds. The local spool must be on a reliable local filesystem if it is to remain usable during shared-filesystem outages.
 
-Compact session projections are cached as disposable atomic sidecars under the project’s `plugin-data/project-memory/compact` directory. The source transcript remains authoritative; its content digest and indexed session metadata invalidate stale sidecars. Rendering the session index never parses transcripts or creates cache files.
+Prior-session discovery reads the project catalog without probing every checkpoint. Opening a `ses_…` buffer loads a saved immutable revision in the background and pins its projection. Pending or unavailable reads are reported as such. Projection caches are local, not shared writes. Projections contain complete user/final-assistant turn blocks in reverse chronological order, omit tool activity, and retain source revision and entry references. Current and RLM sessions are excluded from the index.
 
-Session-history buffers require Agent Utils support for replaceable lazy special-buffer namespaces. On an older host, the plugin logs a warning and keeps the core memory tools and `project_memory` buffer active. Set `project_memory.project_sessions.enabled=false` to disable only the session-history surfaces.
+Regex evaluation has a computation budget, and automatic recall is best-effort: individual searches are bounded to 5 ms, a recall pass to 50 ms, each event to 64 KiB, and pending recall to eight memories. Expensive/noisy triggers can therefore miss matches and should be refined. Backtests report incomplete evaluation. Transcript-tail tracking prevents bounded event-ID retention from replaying old history in long sessions; existing compaction-aware context deduplication is retained.
 
-Install with:
+## Development install
 
-```bash
-pixi run azo-plugin install .
-```
-
-Installation creates an editable config at:
-
-```text
-~/.local/share/agent-zoo/plugin-configs/azo-plugin-project-memory/config/project_memory.yaml
-```
-
-The `project_memory.system_prompt` value controls the guidance appended to the model-visible system prompt. Launch-time `--config-set project_memory.system_prompt=...` values override the installed file. Set `project_memory.enabled=false` to disable registration, then run `/reload` in an existing TUI session.
-
-Run tests with:
+Use the dev-root wrapper and explicitly select its state root. Inherited production environment variables otherwise override the intended location. Substitute your own checkout and install paths:
 
 ```bash
-pixi run --environment test test
+DEV="$HOME/.local/share/agent-zoo-dev"
+PLUGIN="$HOME/Documents/GitHub/azo-plugin-project-memory-worktrees/dev-filesystem"
+env -u PYTHONPATH AGENT_ZOO_STATE_ROOT="$DEV" AGENT_ZOO_HOME="$DEV" \
+  "$DEV/bin/azo-plugin" install "$PLUGIN" --force
 ```
+
+The installer declares dependencies through Pixi and preserves existing installed configuration unless `--force-config` is requested. Restart or `/reload` the dev backend after installation. The installed YAML lives under `plugin-configs/azo-plugin-project-memory/config/project_memory.yaml`; repository YAML is its template.
+
+## Verification
+
+Run tests using the environment that contains the matching Agent Zoo, Agent Utils, and tmux-pilot revisions, with this repository's `src` on `PYTHONPATH`. The plugin's own test environment does not silently select sibling production checkouts.
+
+`scripts/live_dev_probe.py --dev-root PATH` uses the installed launcher and a real Luna model to exercise memory recording, cross-session recall, immutable history, editing, suppression, deletion, and restart. It creates a uniquely named test project in the dev root and prints retained backend/tool evidence. Model credentials are required. Its observation deadlines belong to the diagnostic, not the plugin's operation lifecycle.
+
+## Migration and limitations
+
+Initial import of the old `azo_project_memories` SQLite table is an explicit offline operation, not a runtime fallback. Do not point the new plugin at old mutable `session.json` files: import those sessions through the harness's initial checkpoint importer first.
+
+Validation evidence and the final importer invocation are recorded after integration. Local delayed/unavailable-storage tests do not qualify a particular two-host NFS deployment; that still requires testing on the intended mount.
