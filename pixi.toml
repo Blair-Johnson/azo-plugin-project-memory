@@ -6,6 +6,7 @@ platforms = ["linux-64", "osx-arm64", "osx-64"]
 [dependencies]
 python = ">=3.11"
 pyyaml = "*"
+regex = "*"
 
 [feature.test.dependencies]
 pexpect = ">=4.9"
@@ -15,7 +16,7 @@ regex = "*"
 pytest = ">=8"
 
 [feature.test.tasks]
-test = "PYTHONPATH=../agent-zoo:../agent-utils/src:../tmux-pilot/src:src python -m pytest -q"
+test = "PYTHONPATH=src python -m pytest -q"
 
 [environments]
 test = ["test"]

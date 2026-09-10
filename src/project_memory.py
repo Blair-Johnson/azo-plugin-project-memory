@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+import regex
 
 from agent_utils import Entry, Feature, MODEL_RENDER_CHANNEL, Tool, estimate_tokens
 from agent_utils.components import (
@@ -60,6 +61,27 @@ PENDING_RECALLS_ATTR = "project_memory_pending_recalls"
 BOOTSTRAPPED_ATTR = "project_memory_scan_bootstrapped"
 LAST_ENTRY_COUNT_ATTR = "project_memory_last_entry_count"
 MAX_SEEN_EVENTS = 4096
+REGEX_SECONDS = 0.005
+RECALL_SECONDS = 0.05
+MAX_MATCH_TEXT = 65536
+MAX_RECALLS = 8
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_trigger(pattern: str):
+    return regex.compile(pattern)
+
+
+def _trigger_matches(pattern, text: str, deadline: float) -> bool:
+    remaining = min(REGEX_SECONDS, deadline - time.monotonic())
+    if remaining <= 0:
+        return False
+    try:
+        return pattern.search(text[:MAX_MATCH_TEXT], timeout=remaining) is not None
+    except TimeoutError:
+        return False
+
+
 MAX_BACKTEST_MATCHES = 12
 MAX_BACKTEST_EXCERPT_CHARS = 600
 PROJECT_SESSIONS_BUFFER_ID = "project_sessions"
@@ -1298,7 +1320,10 @@ class ProjectMemoryRecall:
         queued_ids = {str(item.get("id") or "") for item in pending if isinstance(item, Mapping)}
         event_texts = [text for _event_id, text in events if text]
 
+        deadline = time.monotonic() + RECALL_SECONDS
         for memory in memories:
+            if time.monotonic() >= deadline or len(pending) >= MAX_RECALLS:
+                break
             memory_id = memory["id"]
             if memory_id in queued_ids or memory_id in suppressions:
                 continue
@@ -1306,11 +1331,11 @@ class ProjectMemoryRecall:
             if not content or self._content_is_active(content, active_text):
                 continue
             try:
-                trigger = re.compile(str(memory.get("trigger") or ""))
-            except re.error:
+                trigger = _compile_trigger(str(memory.get("trigger") or ""))
+            except regex.error:
                 log.warning("Skipping project memory %s with invalid stored regex", memory_id)
                 continue
-            if not any(trigger.search(text) for text in event_texts):
+            if not any(_trigger_matches(trigger, text, deadline) for text in event_texts):
                 continue
             pending.append({"id": memory_id, "content": content})
             queued_ids.add(memory_id)
@@ -1330,7 +1355,15 @@ class ProjectMemoryRecall:
         bootstrapped = bool(getattr(state, BOOTSTRAPPED_ATTR, False))
         current_step = self._int_value(getattr(state, "step", 0), 0)
 
-        for position, entry in enumerate(entries):
+        previous_count = self._int_value(getattr(state, LAST_ENTRY_COUNT_ATTR, 0), 0)
+        # Revisit the mutable tail for tool completion, not the entire saved history.
+        # A truncation/replacement is a new baseline, not thousands of new events.
+        reset = len(entries) < previous_count
+        start = max(0, previous_count - 2) if bootstrapped and not reset else 0
+        if reset:
+            bootstrapped = False
+        for position in range(start, len(entries)):
+            entry = entries[position]
             entry_step = self._int_value(self._get(entry, "step", -1), -1)
             for event_id, text in self._entry_events(entry, position):
                 current_ids.append(event_id)
@@ -1411,7 +1444,7 @@ class ProjectMemoryRecall:
         exclusion is used to avoid matching the active ``record_memory`` call
         against its own trigger argument.
         """
-        pattern = re.compile(str(trigger))
+        pattern = _compile_trigger(str(trigger))
         entries = list(getattr(state, "entries", []) or [])
         start, handoff_text = self._active_context_window(state, entries)
         excluded = {str(event_id) for event_id in exclude_event_ids}
@@ -1430,8 +1463,20 @@ class ProjectMemoryRecall:
 
         matches: list[dict[str, str]] = []
         truncated = False
+        deadline = time.monotonic() + RECALL_SECONDS
         for label, text in reversed(candidates):
-            if not pattern.search(text):
+            remaining = min(REGEX_SECONDS, deadline - time.monotonic())
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(text) > MAX_MATCH_TEXT:
+                truncated = True
+            try:
+                matched = pattern.search(text[:MAX_MATCH_TEXT], timeout=remaining)
+            except TimeoutError:
+                truncated = True
+                continue
+            if not matched:
                 continue
             if len(matches) >= MAX_BACKTEST_MATCHES:
                 truncated = True
