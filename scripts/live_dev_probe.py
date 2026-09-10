@@ -41,6 +41,9 @@ async def run(args):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("AGENT_ZOO_", "AZO_WIRE_", "AZO_TUI_")) and k != "PYTHONPATH"}
         env["AGENT_ZOO_LOCAL_STATE_ROOT"] = str(root / "local")
+        env["PYTHONPATH"] = str(Path(__file__).parent.resolve() / "memory_fault_hook")
+        env["AZO_MEMORY_TEST_OUTAGE"] = str(root / "memory-sharing-offline")
+        env["AZO_MEMORY_TEST_PROJECT"] = project
         command = [str(args.dev_root / "bin/azo-start"), "--home", str(args.dev_root),
                    "--project", project, "--workdir", str(root), "--host", "127.0.0.1",
                    "--port", "0", "--model", "gpt-5.6-luna-max"]
@@ -96,6 +99,8 @@ async def exercise(args, command, env, clients, project):
                f'Then call suppress_memory(id="{memory_id}", turns=2).', "MEMORY_UPDATED")
     await asyncio.wait_for(second.close(), 60)
 
+    outage = Path(env["AZO_MEMORY_TEST_OUTAGE"])
+    outage.touch()
     resumed = await connect(command + ["--resume", first_id], env, clients)
     text = await turn(resumed, 'Use view(buffer="project_memory") and report the current reviewer rule. '
                       'If the snapshot is loading, retry.', "MEMORY_RESTARTED")
@@ -103,7 +108,15 @@ async def exercise(args, command, env, clients, project):
     text = await turn(resumed, f'Call delete_memory(id="{memory_id}"). Then view project_memory to confirm deletion.', "MEMORY_DELETED")
     assert any("Deleted" in result for result in results(resumed, "delete_memory")), "Missing deletion receipt"
     assert results(second, "update_memory") and results(second, "suppress_memory"), "Missing mutation tools"
+    assert any("local queued" in result.lower() for result in results(resumed, "delete_memory")), "Expected local-only outage receipt"
+    emit("offline_restart_and_delete", session_id=first_id, memory_id=memory_id)
     await asyncio.wait_for(resumed.close(), 60)
+    outage.unlink()
+    recovered = await connect(command + ["--resume", first_id], env, clients)
+    text = await turn(recovered, 'Use view(buffer="project_memory"). If sharing is still pending, retry. '
+        'Confirm that the deleted memory is absent and report synchronization status.', "MEMORY_RECOVERED")
+    assert "## " + memory_id not in results(recovered, "view")[-1], "Deleted memory reappeared"
+    await asyncio.wait_for(recovered.close(), 60)
     emit("passed", project=project, memory_id=memory_id, restarted_session=first_id)
 
 def main():
