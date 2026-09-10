@@ -994,12 +994,7 @@ class ProjectSessionBuffers:
             if index_raw:
                 project_dir = Path(index_raw).parent.parent
             else:
-                run_db = getattr(state, "run_db", None)
-                agent_db = getattr(run_db, "agent_db", None) or getattr(state, "agent_db", None)
-                db_path = str(getattr(agent_db, "path", "") or "").strip()
-                if not db_path:
-                    return project_name, None, current_session_id
-                project_dir = Path(db_path).parent
+                return project_name, None, current_session_id
         return project_name, project_dir, current_session_id
 
     @staticmethod
