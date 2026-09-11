@@ -2213,6 +2213,20 @@ class ProjectSessionBuffers:
                     while len(self._projection_cache) > SESSION_PROJECTION_CACHE_LIMIT:
                         self._projection_cache.popitem(last=False)
 
+            # The immutable content cache is independent of this load receipt.
+            # In particular, local-first success does not prove shared freshness.
+            source = _one_line_text(getattr(loaded, "source", ""), "unknown")
+            receipt = [
+                f"Checkpoint source: {source}.",
+                "Pinned projection: unchanged until backend restart; restart releases "
+                "the pin, not the local checkpoint cache.",
+            ]
+            receipt.extend(
+                f"Checkpoint note: {_bounded_history_error(warning)}"
+                for warning in getattr(loaded, "warnings", ())
+            )
+            text = "\n".join(receipt) + "\n\n" + text
+
             with self._lock:
                 binding = self._pinned_revisions.get(scope_key)
                 if binding is not None:
@@ -3168,58 +3182,77 @@ class ProjectMemorySystemPrompt(RenderTransformRegistrar):
         return base / "agent-zoo"
 
 
+def _subfeature_enabled(section: Mapping[str, Any], name: str) -> bool:
+    value = section.get(name, True)
+    if isinstance(value, Mapping):
+        value = value.get("enabled", True)
+    return _config_enabled(value)
+
+
 def register_features(builder, *, session, config):
-    """Register the project_memory feature in every Agent Zoo pipeline."""
+    """Register enabled project-memory sub-features in every Agent Zoo pipeline."""
     del session
     section = ProjectMemorySystemPrompt.effective_section(config)
     if not ProjectMemorySystemPrompt.enabled(section.get("enabled", True)):
         return
 
-    session_config = section.get("project_sessions", True)
-    if isinstance(session_config, Mapping):
-        sessions_requested = ProjectMemorySystemPrompt.enabled(
-            session_config.get("enabled", True)
-        )
+    regex_memories_enabled = _subfeature_enabled(section, "regex_memories")
+    sessions_enabled = _subfeature_enabled(section, "project_sessions")
+    if not regex_memories_enabled and not sessions_enabled:
+        return
+
+    if regex_memories_enabled and sessions_enabled:
+        prompt = str(section.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
+    elif regex_memories_enabled:
+        prompt = CORE_SYSTEM_PROMPT
     else:
-        sessions_requested = ProjectMemorySystemPrompt.enabled(session_config)
-    sessions_enabled = sessions_requested
+        prompt = SESSION_SYSTEM_PROMPT
 
-    prompt = str(section.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
-    if not sessions_enabled:
-        prompt = prompt.replace(SESSION_SYSTEM_PROMPT, "").strip()
+    components = []
+    order = [TurnCounter, RegisterSpecialBuffers]
 
-    store = ProjectMemoryStore(ProjectMemorySystemPrompt.common_memories(section))
-    recall = ProjectMemoryRecall(store)
-    components = [
-        store,
-        ProjectMemoryBuffer(store),
-        RecordMemory(store, recall),
-        UpdateMemory(store),
-        SuppressMemory(store),
-        DeleteMemory(store),
-        recall,
-        ProjectMemoryDelivery(),
-        ProjectMemorySystemPrompt(prompt),
-    ]
-    order = [
-        TurnCounter,
-        RegisterSpecialBuffers,
-        ProjectMemoryStore,
-        ProjectMemoryBuffer,
-        ToolDispatchStart,
-        ConsolidateToolResults,
-        FailedToolCallRecorder,
-        ProjectMemoryRecall,
-        ProjectMemoryDelivery,
-        CompressToolResults,
-        SystemPromptSkillList,
-        ProjectMemorySystemPrompt,
-        ExcludeForgotten,
-        MessageRenderer,
-    ]
+    if regex_memories_enabled:
+        store = ProjectMemoryStore(ProjectMemorySystemPrompt.common_memories(section))
+        recall = ProjectMemoryRecall(store)
+        components.extend(
+            [
+                store,
+                ProjectMemoryBuffer(store),
+                RecordMemory(store, recall),
+                UpdateMemory(store),
+                SuppressMemory(store),
+                DeleteMemory(store),
+                recall,
+                ProjectMemoryDelivery(),
+            ]
+        )
+        order.extend([ProjectMemoryStore, ProjectMemoryBuffer])
+
     if sessions_enabled:
-        components.insert(2, ProjectSessionBuffers())
-        order.insert(order.index(ToolDispatchStart), ProjectSessionBuffers)
+        components.append(ProjectSessionBuffers())
+        order.append(ProjectSessionBuffers)
+
+    order.append(ToolDispatchStart)
+    if regex_memories_enabled:
+        order.extend(
+            [
+                ConsolidateToolResults,
+                FailedToolCallRecorder,
+                ProjectMemoryRecall,
+                ProjectMemoryDelivery,
+                CompressToolResults,
+            ]
+        )
+
+    components.append(ProjectMemorySystemPrompt(prompt))
+    order.extend(
+        [
+            SystemPromptSkillList,
+            ProjectMemorySystemPrompt,
+            ExcludeForgotten,
+            MessageRenderer,
+        ]
+    )
 
     builder.add(
         Feature(
