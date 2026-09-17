@@ -107,9 +107,9 @@ SESSION_SYSTEM_PROMPT = (
     "contiguous sequence of turns until you have enough context; do not stop at the first "
     "turn or treat it as a summary. If a recent turn depends on an older decision, "
     "continue downward into earlier turns. For an unusually long buffer, use grep only to "
-    "locate a relevant area, then read the surrounding turn blocks. Use the Source "
-    "Transcript path and entry/line pointers when omitted tool activity or full-session "
-    "detail is needed."
+    "locate a relevant area, then read the surrounding turn blocks. Source Commit and "
+    "Source Instance identify the exact canonical document; entry indices refer to that "
+    "document, not journal file lines. Use the canonical session loader for omitted detail."
 )
 DEFAULT_SYSTEM_PROMPT = f"{CORE_SYSTEM_PROMPT} {SESSION_SYSTEM_PROMPT}"
 
@@ -189,7 +189,7 @@ def _session_buffer_ids(sessions: Sequence[Mapping[str, Any]]) -> dict[str, str]
 
 
 def _session_source(project_dir: Path, session_id: str) -> Path:
-    """Return the logical checkpoint locator without touching shared storage."""
+    """Return the logical session locator without touching shared storage."""
     if (
         not session_id
         or "\x00" in session_id
@@ -272,37 +272,6 @@ def _content_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _entry_line_ranges(source_text: str) -> dict[int, tuple[int, int]]:
-    ranges: dict[int, tuple[int, int]] = {}
-    in_entries = False
-    start_line: int | None = None
-    entry_index: int | None = None
-    index_pattern = re.compile(r'^\s{6}"index":\s*(-?\d+),?\s*$')
-    for line_number, line in enumerate(source_text.splitlines(), start=1):
-        stripped = line.rstrip("\r\n")
-        if not in_entries:
-            if stripped == '  "entries": [':
-                in_entries = True
-            continue
-        if start_line is None:
-            if stripped == "    {":
-                start_line = line_number
-                entry_index = None
-                continue
-            if stripped == "  ],":
-                break
-            continue
-        match = index_pattern.match(stripped)
-        if match:
-            entry_index = int(match.group(1))
-        if stripped in {"    },", "    }"}:
-            if entry_index is not None:
-                ranges[entry_index] = (start_line, line_number)
-            start_line = None
-            entry_index = None
-    return ranges
-
-
 def _compact_turns(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Keep complete user/final-assistant turn blocks, oldest-to-newest."""
     turns: list[dict[str, Any]] = []
@@ -354,47 +323,43 @@ def _compact_turns(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
     return turns
 
 
-def _entry_delimiter(role: str, entry_index: int, ranges: Mapping[int, tuple[int, int]]) -> str:
-    source_range = ranges.get(entry_index)
-    if source_range is None:
-        return f"{role} [entry {entry_index}]"
-    return f"{role} [entry {entry_index}, lines {source_range[0]}-{source_range[1]}]"
-
-
 def _build_compact_transcript(
     session: Mapping[str, Any],
-    source: Path,
+    document: Mapping[str, Any],
     *,
-    revision_id: str = "",
+    commit_id: str,
+    instance_id: str,
+    source_format: str,
     generated_at: float,
-    source_text: str | None = None,
 ) -> str:
-    """Build a projection from an AU-validated immutable payload."""
-    if source_text is None:
-        source_text = source.read_text(encoding="utf-8")
-    document = json.loads(source_text)
+    """Project a validated canonical document without restoring opaque state.
+
+    Journals do not contain a standalone transcript JSON file. Entry indices are
+    canonical-document pointers, never fabricated journal-file line numbers.
+    """
     raw_entries = document.get("entries")
     if not isinstance(raw_entries, list):
         state = document.get("state")
         raw_entries = state.get("entries") if isinstance(state, Mapping) else []
     entries = [item for item in (raw_entries or []) if isinstance(item, Mapping)]
-    ranges = _entry_line_ranges(source_text)
     lines = [
         f"Session ID: {session['session_id']}",
         f"Title: {_one_line_text(session.get('title'), '(untitled)')}",
         f"Description: {_one_line_text(session.get('description'), '(none)')}",
-        f"Created (UTC): {_format_utc(session.get('created_at'))}",
-        f"Updated (UTC): {_format_utc(session.get('updated_at'))}",
+        f"Catalog Created (UTC): {_format_utc(session.get('created_at'))}",
+        f"Catalog Updated (UTC): {_format_utc(session.get('updated_at'))}",
         f"Buffer Generated (UTC): {_format_utc(generated_at)}",
         "Order: Newest turn first",
-        f"Source Transcript: {source}",
-        f"Source Revision: {revision_id or '(unknown immutable revision)'}",
+        f"Source Commit: {commit_id}",
+        f"Source Instance: {instance_id}",
+        f"Source Format: {source_format}",
+        "Entry pointers: canonical document indices, not journal file lines.",
     ]
     for turn in reversed(_compact_turns(entries)):
         lines.extend(
             [
                 "",
-                _entry_delimiter("USER", turn["user_entry"], ranges),
+                f"USER [entry {turn['user_entry']}]",
                 turn["user_text"],
             ]
         )
@@ -402,21 +367,21 @@ def _build_compact_transcript(
             lines.extend(
                 [
                     "",
-                    _entry_delimiter("ASSISTANT", turn["assistant_entry"], ranges),
+                    f"ASSISTANT [entry {turn['assistant_entry']}]",
                     turn["assistant_text"],
                 ]
             )
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _projection_cache_key(session: Mapping[str, Any], revision_id: str) -> tuple[str, str, str]:
+def _projection_cache_key(session: Mapping[str, Any], commit_id: str) -> tuple[str, str, str]:
     metadata = {
         key: session.get(key)
         for key in ("title", "description", "created_at", "updated_at", "kind")
     }
     return (
         str(session.get("session_id") or ""),
-        str(revision_id or ""),
+        str(commit_id or ""),
         json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str),
     )
 
@@ -1759,7 +1724,7 @@ class ProjectMemoryBuffer:
 
 
 class ProjectSessionBuffers:
-    """Expose previous project sessions through immutable revision projections."""
+    """Expose previous project sessions through exact canonical commit projections."""
 
     reads = {"buffer_manager"}
     optional_reads = {"_agent_zoo_context", "_session_id", "_local_state_root", "run_db", "agent_db"}
@@ -1777,7 +1742,7 @@ class ProjectSessionBuffers:
         self._inventories: dict[str, dict[str, Any]] = {}
         self._buffer_records: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._session_results: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
-        self._pinned_revisions: dict[tuple[str, str], dict[str, str]] = {}
+        self._pinned_commits: dict[tuple[str, str], dict[str, str]] = {}
         self._projection_cache: OrderedDict[tuple[str, str, str], str] = OrderedDict()
 
     def bind_session(
@@ -2100,13 +2065,13 @@ class ProjectSessionBuffers:
         buffer_id: str,
         session: Mapping[str, Any],
         local_state_root: str | None,
-        revision_id: str | None,
+        commit_id: str | None,
     ) -> bool:
         session_id = str(session["session_id"])
         scope_key = self._session_scope_key(project_key, buffer_id)
         now = float(self.clock())
         with self._lock:
-            binding = self._pinned_revisions.get(scope_key)
+            binding = self._pinned_commits.get(scope_key)
             if binding is not None:
                 if binding["session_id"] != session_id:
                     self._session_results[scope_key] = {
@@ -2120,8 +2085,8 @@ class ProjectSessionBuffers:
                         "retry_at": None,
                     }
                     return False
-                revision_id = binding["revision_id"]
-            elif revision_id is None and len(self._pinned_revisions) >= SESSION_BUFFER_RECORD_LIMIT:
+                commit_id = binding["commit_id"]
+            elif commit_id is None and len(self._pinned_commits) >= SESSION_BUFFER_RECORD_LIMIT:
                 self._session_results[scope_key] = {
                     "status": "unavailable",
                     "error": "session history pin capacity reached; refusing to retarget a buffer",
@@ -2144,7 +2109,7 @@ class ProjectSessionBuffers:
             "buffer_id": buffer_id,
             "session": dict(session),
             "local_state_root": local_state_root,
-            "revision_id": revision_id,
+            "commit_id": commit_id,
         }
         if self._enqueue("session", payload):
             return True
@@ -2164,48 +2129,46 @@ class ProjectSessionBuffers:
         scope_key = self._session_scope_key(project_key, buffer_id)
         session = dict(payload["session"])
         session_id = str(session["session_id"])
-        revision_id = str(payload.get("revision_id") or "").strip() or None
+        commit_id = str(payload.get("commit_id") or "").strip() or None
         try:
-            from agent_zoo.checkpoint_sync import PendingCheckpointLoad, load_checkpoint
+            from agent_zoo.session_load import PendingSessionLoad, load_session
 
             locator = _session_source(Path(payload["project_dir"]), session_id)
-            loaded = load_checkpoint(
+            loaded = load_session(
                 locator,
                 session_id=session_id,
-                revision_id=revision_id,
+                commit_id=commit_id,
                 local_state_root=payload.get("local_state_root"),
-                # The worker owns the wait.  A zero observer budget prevents a
-                # caller-facing view from blocking on shared storage.
-                shared_timeout_s=0.0,
+                # Only this worker waits. Caller-facing buffer views never wait
+                # for journal replay or shared storage.
+                timeout_s=0.0,
             )
-            if isinstance(loaded, PendingCheckpointLoad):
+            if isinstance(loaded, PendingSessionLoad):
                 loaded = loaded.wait(timeout_s=None)
-            loaded_revision = getattr(loaded, "revision", None)
-            actual_revision_id = str(getattr(loaded_revision, "revision_id", "") or "").strip()
-            payload_path = Path(getattr(loaded, "payload_path", ""))
-            if not actual_revision_id or not payload_path.name:
-                raise RuntimeError("checkpoint loader returned no immutable revision payload")
-            if revision_id is not None and actual_revision_id != revision_id:
+            saved = loaded.state
+            actual_commit_id = str(saved.commit_id or "").strip()
+            if not actual_commit_id or not isinstance(saved.document, Mapping):
+                raise RuntimeError("session loader returned no canonical committed document")
+            if saved.session_id != session_id:
+                raise RuntimeError("session loader returned a different session")
+            if commit_id is not None and actual_commit_id != commit_id:
                 raise RuntimeError(
-                    f"checkpoint loader selected revision {actual_revision_id!r}, expected {revision_id!r}"
+                    f"session loader selected commit {actual_commit_id!r}, expected {commit_id!r}"
                 )
 
-            cache_key = _projection_cache_key(session, actual_revision_id)
+            cache_key = _projection_cache_key(session, actual_commit_id)
             with self._lock:
                 text = self._projection_cache.get(cache_key)
                 if text is not None:
                     self._projection_cache.move_to_end(cache_key)
             if text is None:
-                # load_checkpoint has already run the real AU revision validator,
-                # including session.json/blob references.  This read is only the
-                # immutable payload used for the compact projection.
-                source_text = payload_path.read_text(encoding="utf-8")
                 text = _build_compact_transcript(
                     session,
-                    payload_path,
-                    revision_id=actual_revision_id,
+                    saved.document,
+                    commit_id=actual_commit_id,
+                    instance_id=saved.instance_id,
+                    source_format=saved.source_format,
                     generated_at=self.clock(),
-                    source_text=source_text,
                 )
                 with self._lock:
                     self._projection_cache[cache_key] = text
@@ -2217,42 +2180,49 @@ class ProjectSessionBuffers:
             # In particular, local-first success does not prove shared freshness.
             source = _one_line_text(getattr(loaded, "source", ""), "unknown")
             receipt = [
-                f"Checkpoint source: {source}.",
+                f"Session source: {source}.",
+                f"Source Repository: {saved.repository}",
+                f"Source Commit Created (UTC): {_format_utc(saved.created_at)}",
                 "Pinned projection: unchanged until backend restart; restart releases "
-                "the pin, not the local checkpoint cache.",
+                "the pin, not local saved history. No cross-host latest-state guarantee.",
             ]
-            receipt.extend(
-                f"Checkpoint note: {_bounded_history_error(warning)}"
-                for warning in getattr(loaded, "warnings", ())
-            )
+            if saved.journal_path is not None:
+                receipt.append(f"Source Journal: {saved.journal_path}")
+            if source == "local":
+                receipt.append(
+                    "Session note: local-first source alone does not establish shared freshness."
+                )
+            receipt.append(f"Freshness: {loaded.freshness}")
+            if loaded.warning:
+                receipt.append(f"Session note: {_bounded_history_error(loaded.warning)}")
             text = "\n".join(receipt) + "\n\n" + text
 
             with self._lock:
-                binding = self._pinned_revisions.get(scope_key)
+                binding = self._pinned_commits.get(scope_key)
                 if binding is not None:
                     if binding["session_id"] != session_id:
                         raise RuntimeError(
                             f"buffer is pinned to session {binding['session_id']}; "
                             f"loaded {session_id} instead"
                         )
-                    if binding["revision_id"] != actual_revision_id:
+                    if binding["commit_id"] != actual_commit_id:
                         raise RuntimeError(
-                            f"buffer is pinned to revision {binding['revision_id']}; "
-                            f"loaded {actual_revision_id} instead"
+                            f"buffer is pinned to commit {binding['commit_id']}; "
+                            f"loaded {actual_commit_id} instead"
                         )
                 else:
-                    if len(self._pinned_revisions) >= SESSION_BUFFER_RECORD_LIMIT:
+                    if len(self._pinned_commits) >= SESSION_BUFFER_RECORD_LIMIT:
                         raise RuntimeError(
                             "session history pin capacity reached; refusing to retarget a buffer"
                         )
-                    self._pinned_revisions[scope_key] = {
-                        "revision_id": actual_revision_id,
+                    self._pinned_commits[scope_key] = {
+                        "commit_id": actual_commit_id,
                         "session_id": session_id,
                     }
                 self._session_results[scope_key] = {
                     "status": "ready",
                     "text": text,
-                    "revision_id": actual_revision_id,
+                    "commit_id": actual_commit_id,
                     "project_key": project_key,
                     "session_id": session_id,
                     "cache_key": cache_key,
@@ -2263,7 +2233,7 @@ class ProjectSessionBuffers:
                         (
                             key
                             for key in self._session_results
-                            if key not in self._pinned_revisions
+                            if key not in self._pinned_commits
                         ),
                         None,
                     )
@@ -2331,10 +2301,10 @@ class ProjectSessionBuffers:
         binding = None
         result = None
         with self._lock:
-            binding = self._pinned_revisions.get(scope_key)
+            binding = self._pinned_commits.get(scope_key)
             result = self._session_results.get(scope_key)
             if binding is not None:
-                pinned = binding["revision_id"]
+                pinned = binding["commit_id"]
                 if binding["session_id"] != str(session["session_id"]):
                     return self._status_view(
                         requested,
@@ -2353,7 +2323,7 @@ class ProjectSessionBuffers:
                     id=requested,
                     path=(
                         f"project-memory://sessions/{session['session_id']}"
-                        f"/revisions/{result['revision_id']}"
+                        f"/commits/{result['commit_id']}"
                     ),
                     # Do not rebuild headers from a newer catalog row: a pinned
                     # projection is the exact text first returned to the caller.
@@ -2363,7 +2333,7 @@ class ProjectSessionBuffers:
             return self._status_view(
                 requested,
                 "pending",
-                "The immutable revision is loading in the bounded background worker.",
+                "The committed document is loading in the bounded background worker.",
             )
         if isinstance(result, Mapping) and result.get("status") == "unavailable":
             error = _bounded_history_error(result.get("error"))
@@ -2374,7 +2344,7 @@ class ProjectSessionBuffers:
                 return self._status_view(
                     requested,
                     "unavailable",
-                    f"The immutable revision could not be loaded: {error}",
+                    f"The committed document could not be loaded: {error}",
                 )
 
         queued = self._queue_session_load(
@@ -2387,7 +2357,7 @@ class ProjectSessionBuffers:
                 state,
                 dict(getattr(state, "_agent_zoo_context", {}) or {}),
             ),
-            revision_id=pinned,
+            commit_id=pinned,
         )
         if not queued:
             with self._lock:
@@ -2401,7 +2371,7 @@ class ProjectSessionBuffers:
         return self._status_view(
             requested,
             "pending",
-            "The immutable preferred revision is queued for local-first loading.",
+            "The selected canonical continuation is queued for local-first loading.",
         )
 
 
