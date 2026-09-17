@@ -1918,7 +1918,7 @@ class ProjectSessionBuffers:
             id=buffer_id,
             path=f"project-memory://sessions/{buffer_id}/{label}",
             text=(
-                f"Session buffer {buffer_id}: {label}.\n"
+                f"Session buffer {buffer_id}:\n"
                 f"{detail}\n"
             ),
         )
@@ -2067,7 +2067,7 @@ class ProjectSessionBuffers:
         return self._status_view(requested, "pending",
             f"Title: {_one_line_text(session.get('title'), '(untitled)')}\n"
             f"Description: {_one_line_text(session.get('description'), '(none)')}\n"
-            "The canonical document is loading; re-read this buffer shortly.")
+            "Transcript load requested. Please try again shortly.")
 
 
 class ProjectMemoryTool(Tool):
