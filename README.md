@@ -1,71 +1,42 @@
 # Project memory for Agent Zoo
 
-This branch targets the canonical journal filesystem lifecycle harness (`agent_zoo.session_load` plus Agent Utils canonical documents). It keeps the `record_memory`, `update_memory`, `suppress_memory`, and `delete_memory` tools, regex-triggered recall, and the `project_memory`, `project_sessions`, and `ses_…` readonly buffers. It does not use the old AgentDB SQLite connection or require an orchestrator.
+This userspace plugin provides two independently enabled features: canonical project-session history and regex-triggered durable memories. It requires the current journal-aware `agent_zoo.session_load` API and lazy readonly buffer namespaces.
 
-## Behavior
+## Session history
 
-Project memories are independent records. Explicit writes are saved locally before being queued for publication to shared storage. Tool receipts distinguish local persistence from shared publication. Concurrent edits are checked against their expected revisions rather than silently overwriting another writer. Configured memories remain readonly; suppression remains session-local.
+`project_sessions` lists saved sessions newest-first, excluding the current session and RLMs. Catalog discovery is asynchronous and metadata-only; it does not open every session. A failed refresh retains the last good catalog and reports its status.
 
-Recall uses an in-memory last-good memory snapshot while a background worker refreshes it. Shared storage errors are not interpreted as an empty memory collection. Routine synchronization is quiet; inspect `project_memory` for status. Local-only changes are not available on other hosts until publication succeeds. The local spool must be on a reliable local filesystem if it is to remain usable during shared-filesystem outages.
+Opening a listed `ses_…` buffer starts or reuses a canonical background load. An explicit read allows up to 200 ms of waiting so fast document loads return content on the first call. This bounds waiting, not CPU time for copying or projection; an unknown catalog can still return pending. If a document is still loading, the response includes known session metadata rather than pretending history is empty. Slow session loads do not occupy the catalog worker or prevent other sessions from starting. Idle catalog workers exit.
 
-Prior-session discovery reads the project catalog without probing every session repository. Opening a `ses_…` buffer uses `agent_zoo.session_load.load_session` in the background, projects `LoadedSession.state.document` directly, and pins the exact `state.commit_id`. Journal-only sessions and mixed legacy/journal repositories use the same canonical selection rules as the harness; genuine ambiguity is reported, never resolved by timestamp or silently retried through the historical checkpoint loader. Pending or unavailable reads are reported as such. Projection caches are in memory, not shared writes or temporary JSON snapshots. Projections contain complete user/final-assistant turn blocks in reverse chronological order, omit tool activity, and retain exact source commit, instance, and entry references. Current and RLM sessions are excluded from the index.
+Projections contain user/final-assistant turn blocks, newest-first, with tool activity omitted. The first successful canonical load pins the exact commit and its original provenance for that backend. Catalog removal, short-ID collisions, later saves, and text-cache eviction do not retarget issued pins. There is no 32-session lifetime ceiling: lightweight pins are retained, while transcript text and transient requests/errors are bounded separately. An evicted projection is reconstructed from its exact commit; cache eviction is not a refresh.
 
-Regex evaluation has a computation budget, and automatic recall is best-effort: individual searches are bounded to 5 ms, a recall pass to 50 ms, each event to 64 KiB, and pending recall to eight memories. Expensive/noisy triggers can therefore miss matches and should be refined. Backtests report incomplete evaluation. Transcript-tail tracking prevents bounded event-ID retention from replaying old history in long sessions; existing compaction-aware context deduplication is retained.
+Headers distinguish local availability from shared freshness. A restart releases in-memory pins, but does not discard local saved history or force shared reconciliation. Canonical entry indices refer to the committed document, not journal-file lines. For omitted details, use `load_session` with the header's session and commit identity. No loose `session.json`, disposable snapshot copies, or shared projection sidecars are created.
 
-## Development install
+## Regex memories
 
-Use the dev-root wrapper and explicitly select its state root. Inherited production environment variables otherwise override the intended location. Substitute your own checkout and install paths:
+`record_memory`, `update_memory`, `suppress_memory`, and `delete_memory` manage project-specific guidance with selective regex triggers. Configured memories are readonly; suppression is session-local. Explicit writes persist locally before shared publication, with revision checks against concurrent edits. Inspect `project_memory` for local/shared status and conflicts. Shared failures never erase the last good memory snapshot.
 
-```bash
-DEV="$HOME/.local/share/agent-zoo-dev"
-PLUGIN="$HOME/Documents/GitHub/azo-plugin-project-memory-worktrees/dev-filesystem"
-env -u PYTHONPATH AGENT_ZOO_STATE_ROOT="$DEV" AGENT_ZOO_HOME="$DEV" \
-  "$DEV/bin/azo-plugin" install "$PLUGIN" --force
-```
+Publication acknowledgments stay in the existing local operation record until cleanup completes. Recovery retries acknowledged cleanup rather than overwriting a newer remote edit. Local-only changes are unavailable on other hosts until publication succeeds; the local spool must be on reliable local storage.
 
-The installer declares dependencies through Pixi and preserves existing installed configuration unless `--force-config` is requested. Restart or `/reload` the dev backend after installation. The installed YAML lives under `plugin-configs/azo-plugin-project-memory/config/project_memory.yaml`; repository YAML is its template.
+Recall is best-effort: individual searches have a 5 ms budget, a pass 50 ms, event text 64 KiB, and pending recalls eight memories. Backtests report incomplete evaluation. Refine expensive or noisy triggers rather than relying on exhaustive matching.
 
-## Historical verification
+## Configuration and installation
 
-The existing suite and live-model probe below predate canonical journal history. They are not the September 17 stabilization gate; use the explicitly authorized private provider-free workflow below with matching Agent Zoo, Agent Utils, and tmux-pilot sources. No tests, providers, builds, or installs were run for this reader adaptation.
+The installed `plugin-configs/azo-plugin-project-memory/config/project_memory.yaml` controls the running plugin; `config/project_memory.yaml` is its template. `project_memory.enabled` is the master switch. `project_memory.regex_memories.enabled` and `project_memory.project_sessions.enabled` control the two features independently. An explicit `system_prompt` is honored with either feature enabled; an empty string disables injected guidance. Without one, guidance describes only the enabled features. Launch-time configuration overrides the installed file.
 
-`scripts/live_dev_probe.py --dev-root PATH` uses the installed launcher and a real Luna model to exercise memory recording, cross-session recall, immutable history, editing, suppression, deletion, and restart. It injects shared plugin-storage unavailability, verifies local cached reads and deletion across restart, then checks the actual shared tombstone after recovery. It creates a uniquely named test project in the dev root and prints retained backend/tool evidence. Model credentials are required. Its observation deadlines belong to the diagnostic, not the plugin's operation lifecycle.
+Install through `azo-plugin install PATH` in the intended Agent Zoo environment, then restart or `/reload` that backend. Installation preserves existing configuration unless `--force-config` is requested. Review custom prompts when disabling a feature: explicit text is not rewritten to remove references to disabled tools. Do not deploy to a production backend merely to run tests.
 
-Historical, pre-journal-cutover evidence only: on September 10, 2026, the combined plugin suite passed 46 tests (`rx r16`), both installed pipeline builds passed (`r18`), and the installed real-model acceptance passed in 87 seconds (`r17`). The live run used project `memory-live-35f4446e` and exercised two sessions through four backend lifetimes. The earlier old-SQLite plugin failed its actual `record_memory` call against the new harness (`r2`), establishing the integration failure this migration fixes.
+## Provider-free verification
 
-## Canonical history diagnostic
-
-The September 17, 2026 private provider-free component/filesystem workflow passed for the canonical reader, including mixed history, stable commit pins, independent feature controls and memory CRUD across a storage outage and restore. Its temporary bulk was removed. This does not qualify native backend activation or NFS; the earlier September 10 acceptance does not validate journal history. `scripts/diagnostics/journal_history_probe.py` is an opt-in provider-free workflow for a compatible existing environment. It creates a small private project/home/spool, uses real plugin registration, journal persistence, catalog and buffer APIs, and retains JSON receipts on stdout plus the private files. It refuses an existing `--root`:
+Use an already-installed compatible AZ/AU/tmux-pilot environment. This command neither installs dependencies nor changes production sessions:
 
 ```bash
-# Select already-installed compatible AZ/AU/TP sources; do not install an environment.
-# $PYTHON is that environment's Python. Include this checkout's src on PYTHONPATH.
-PYTHONPATH="$PLUGIN/src:$PYTHONPATH" "$PYTHON" \
-  "$PLUGIN/scripts/diagnostics/journal_history_probe.py" \
-  --root /local/scratch/new-project-memory-probe
+AZ="$HOME/.local/share/agent-zoo/src/agent-zoo"
+PYTHONPATH="$PWD/src" pixi run --manifest-path "$AZ/pixi.toml" --as-is python -m pytest -q tests
 ```
 
-The workflow checks journal-only and mixed-history newest turns, exact old-commit restore, unchanged `ses_…` content after later saves, fresh-reader advancement, independent regex/history/master controls, regex recall and suppression, memory CRUD, last-good cache and locally queued edits across canonical restore during a private storage outage, and shared deletion after recovery. The mixed fixture deliberately uses the historical immutable publisher to create its legacy ancestor; that is fixture preparation, not a runtime fallback. It does not load the managed plugin, call a provider, create an environment, or change production data. It is component/filesystem acceptance, **not** a full backend/TUI restart, divergent-branch repair, multi-host, or NFS qualification. Run it only at the planned private integration gate; remove its explicitly chosen private root after inspecting the evidence.
+The suite uses private fixtures for canonical journals, delayed reads, cache/pin behavior, feature controls, pipeline construction, publication conflicts, and restart recovery. `scripts/diagnostics/journal_history_probe.py --root /local/scratch/NEW-DIRECTORY` additionally exercises registration, mixed journal history, canonical restore, and storage outages in a private project. It refuses an existing root and retains receipts and fixtures. Neither check calls a model provider; neither qualifies a two-host NFS deployment or a native TUI restart.
 
-History headers show source location, repository, journal (when applicable), source format, instance, and exact commit. Canonical entry indices are not journal-file line numbers; no loose `session.json` is promised. For omitted detail, use `load_session` with the header's commit/session identity and inspect its canonical document. The canonical loader's `freshness` and `warning` fields are shown with the pinned source receipt. Local-first success is not proof of shared freshness. A restart releases pins but does not discard local saved history, force shared refresh, or resolve divergent continuations.
+The optional `scripts/live_dev_probe.py` is a separate real-model test requiring credentials and an explicitly chosen development root. Historical acceptance numbers are not a substitute for running the current suite.
 
-## Migration and limitations
-
-Activation is separate from this source change. Do not replace a running old SQLite plugin blindly: stop its writers, preserve its configuration and data, validate the compatible core/plugin sources privately, then coordinate a fresh backend activation. Keep `project_memory.regex_memories` and `project_memory.project_sessions` independent. Existing custom prompts referring to physical Source Transcript paths should be reviewed for canonical commit/entry wording; configuration is not automatically overwritten.
-
-Initial import of the old `azo_project_memories` SQLite table is an explicit offline operation, not a runtime fallback. Do not point the new plugin at old mutable `session.json` files: import those sessions through the harness's initial checkpoint importer first.
-
-With the old writers stopped, import the project's old database into the plugin's dedicated store (not the harness store). IDs and timestamps are retained, reruns skip identical memories, and conflicting destination records are reported rather than overwritten:
-
-```bash
-pixi run --manifest-path "$DEV/src/agent-zoo/pixi.toml" python \
-  "$PLUGIN/scripts/import_sqlite_memories.py" /path/to/old-project.sqlite \
-  "$DEV/projects/PROJECT/plugin-data/project-memory" --dry-run --json
-# Inspect the report, then repeat without --dry-run to import.
-```
-
-The SQLite source is opened read-only. No production memories are imported automatically. Local history projections are bounded to 32 pinned buffers per backend; an exhausted pin budget reports capacity instead of silently changing an existing buffer's meaning. A backend restart releases these in-memory pins.
-
-Local delayed/unavailable-storage tests do not qualify a particular two-host NFS deployment; that still requires testing on the intended mount.
-
-The live backend processes emitted Python multiprocessing semaphore-cleanup warnings at shutdown. This run does not establish their cause or resolve that harness cleanup issue; no plugin tool error or failed acceptance step accompanied them.
+Old SQLite memories can be imported offline with `scripts/import_sqlite_memories.py`; stop old writers first. Import is explicit and conflict-preserving, never a runtime fallback. Session import and repair belong to the harness, not this plugin.

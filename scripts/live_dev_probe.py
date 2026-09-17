@@ -92,9 +92,9 @@ async def exercise(args, command, env, clients, project):
     text = await turn(second, 'Use view(buffer="project_sessions"), then '
         f'view(buffer="ses_{first_id.replace("-", "")[:8]}"). '
         'If a buffer is pending/loading, retry until it is readable. '
-        'Report the saved transcript revision and the prior final reply.', "HISTORY_CHECKED")
-    assert "MEMORY_RECORDED" in text and ("Revision" in text or "revision" in text), "History projection not observed"
-    emit("revision_history", source_session=first_id)
+        'Report the saved transcript commit and the prior final reply.', "HISTORY_CHECKED")
+    assert "MEMORY_RECORDED" in text and "commit" in text.lower(), "History projection not observed"
+    emit("canonical_history", source_session=first_id)
     await turn(second, f'Call update_memory(id="{memory_id}", content="The cobalt launch checklist requires three reviewers."). '
                f'Then call suppress_memory(id="{memory_id}", turns=2).', "MEMORY_UPDATED")
     await asyncio.wait_for(second.close(), 60)

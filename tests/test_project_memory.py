@@ -695,3 +695,20 @@ def test_pre_restore_pass_does_not_bootstrap_recall_state(project_db):
     add_message(state, "assistant", "New historic startup discussion.", step=6)
     recall(state)
     assert [item["id"] for item in state.project_memory_pending_recalls] == [memory["id"]]
+
+
+@pytest.mark.parametrize("regex_enabled,sessions_enabled", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("origin", ["installed", "launch", "empty"])
+def test_custom_prompt_respected_with_independent_features(monkeypatch, regex_enabled, sessions_enabled, origin):
+    installed = {"project_memory": {"system_prompt": "Installed guidance."}}
+    monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: installed)
+    section = {"regex_memories": regex_enabled, "project_sessions": sessions_enabled}
+    expected = {"installed": "Installed guidance.", "launch": "Launch guidance.", "empty": ""}[origin]
+    if origin != "installed":
+        section["system_prompt"] = expected
+    features = []
+    pm.register_features(SimpleNamespace(add=features.append), session=None,
+                         config={"project_memory": section})
+    prompt = next(component for component in features[0].components
+                  if isinstance(component, pm.ProjectMemorySystemPrompt))
+    assert prompt.text == expected

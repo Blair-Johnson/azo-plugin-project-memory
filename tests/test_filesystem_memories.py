@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from tmux_pilot.fs_store import RecordStore
 
 import project_memory as pm
@@ -324,3 +325,73 @@ def test_conflicted_local_tombstone_can_be_resolved_by_normal_delete(tmp_path, m
     finally:
         first.close()
         second.close()
+
+
+@pytest.mark.parametrize("failure", ["snapshot", "overlay", "pending"])
+@pytest.mark.parametrize("deleted", [False, True])
+@pytest.mark.parametrize("successor", [False, True])
+def test_publication_cleanup_recovers_after_restart_and_remote_edit(tmp_path, monkeypatch, failure, deleted, successor):
+    monkeypatch.setenv("AGENT_ZOO_LOCAL_STATE_ROOT", str(tmp_path / "local"))
+    # Drive the real filesystem operations deliberately, without worker races.
+    monkeypatch.setattr(pm.ProjectMemoryStore, "_start_worker_locked", lambda *args: None)
+    state = _state(tmp_path / "shared")
+    store = pm.ProjectMemoryStore()
+    memory = store.create(state, "Original", "original")
+    memory_id = memory["id"]
+    operation_id = store.receipt(memory_id)["operation_id"]
+    local = store._local_store
+    method, namespace = {
+        "snapshot": ("update", store._SNAPSHOT_NAMESPACE),
+        "overlay": ("update", store._OVERLAY_NAMESPACE),
+        "pending": ("delete", store._PENDING_NAMESPACE),
+    }[failure]
+    original = getattr(local, method)
+
+    def fail_cleanup(*args, **kwargs):
+        if args[0] == namespace:
+            raise OSError("injected cleanup failure")
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(local, method, fail_cleanup)
+        store._publish_operation(operation_id, store._generation)
+    assert store.receipt(memory_id)["shared_saved"]
+    assert local.get(store._PENDING_NAMESPACE, operation_id)["status"] == "published"
+    assert operation_id in store._pending
+    if failure == "pending":
+        assert local.get(store._OVERLAY_NAMESPACE, memory_id) is None
+        assert memory_id not in store._overlay
+    remaining = set()
+    if successor:
+        store.update(state, memory_id, content="Newer local memory")
+        remaining.add(store.receipt(memory_id)["operation_id"])
+    expected_overlay = local.get(store._OVERLAY_NAMESPACE, memory_id) if successor else None
+    store.close()
+
+    shared = RecordStore(state._agent_zoo_context["project_dir"] + "/plugin-data/project-memory", create=True)
+    newer = {**shared.get(store._RECORD_NAMESPACE, memory_id), "revision": 2,
+             "operation_id": "remote-edit", "content": "Newer remote memory", "deleted": deleted}
+    shared.put(store._RECORD_NAMESPACE, memory_id, newer)
+    restarted = pm.ProjectMemoryStore()
+    try:
+        restarted.list_all(state)
+        assert restarted._receipts[operation_id]["shared_saved"]
+        assert restarted._next_operation_locked() == operation_id
+        restarted._refresh_shared(restarted._generation)
+        restarted._publish_operation(operation_id, restarted._generation)
+        assert set(restarted._pending) == remaining
+        local = restarted._local_store
+        assert {key for key, _ in local.items(store._PENDING_NAMESPACE)} == remaining
+        assert local.get(store._OVERLAY_NAMESPACE, memory_id) == expected_overlay
+        assert restarted._overlay.get(memory_id) == (expected_overlay["record"] if successor else None)
+        assert restarted._shared_snapshot[memory_id] == newer
+        assert local.get(store._SNAPSHOT_NAMESPACE, memory_id) == newer
+        assert shared.get(store._RECORD_NAMESPACE, memory_id) == newer
+        recalled = restarted.get(state, memory_id)
+        if successor:
+            assert recalled["content"] == "Newer local memory"
+        else:
+            assert recalled is None if deleted else recalled["content"] == newer["content"]
+        assert restarted.snapshot_status()["conflicts"] == []
+    finally:
+        restarted.close()
