@@ -4,22 +4,26 @@ from __future__ import annotations
 
 import functools
 import hashlib
-import inspect
 import json
 import logging
 import operator
 import os
+import queue
 import re
 import secrets
-import sqlite3
+import sys
 import tempfile
+import threading
 import time
+import uuid
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
+import regex
 
 from agent_utils import Entry, Feature, MODEL_RENDER_CHANNEL, Tool, estimate_tokens
 from agent_utils.components import (
@@ -33,16 +37,11 @@ from agent_utils.components import (
     safe_interrupt_text,
 )
 from agent_utils.failed_tool_calls import FailedToolCallRecorder
-try:
-    from agent_utils.files.buffer_manager import (
-        BufferManager,
-        ReadonlyBufferView,
-        StateBoundSpecialBufferNamespaceProvider,
-    )
-except ImportError:  # pragma: no cover - compatibility error is raised at registration
-    from agent_utils.files.buffer_manager import BufferManager, ReadonlyBufferView
-
-    StateBoundSpecialBufferNamespaceProvider = None
+from agent_utils.files.buffer_manager import (
+    BufferManager,
+    ReadonlyBufferView,
+    StateBoundSpecialBufferNamespaceProvider,
+)
 from agents.system_prompt import SystemPromptSkillList
 from agent_zoo.tools.special_buffers import RegisterSpecialBuffers
 
@@ -53,19 +52,39 @@ PLUGIN_NAME = "azo-plugin-project-memory"
 CONFIG_SECTION = "project_memory"
 CONFIG_PATH_ENV = "AZO_PROJECT_MEMORY_CONFIG"
 CONFIG_FILENAME = "project_memory.yaml"
-TABLE_NAME = "azo_project_memories"
 SUPPRESSIONS_ATTR = "project_memory_suppressions"
 SEEN_EVENTS_ATTR = "project_memory_seen_events"
 PENDING_RECALLS_ATTR = "project_memory_pending_recalls"
 BOOTSTRAPPED_ATTR = "project_memory_scan_bootstrapped"
 LAST_ENTRY_COUNT_ATTR = "project_memory_last_entry_count"
+DEFERRED_EVENTS_ATTR = "project_memory_deferred_events"
 MAX_SEEN_EVENTS = 4096
+REGEX_SECONDS = 0.005
+RECALL_SECONDS = 0.05
+MAX_MATCH_TEXT = 65536
+MAX_RECALLS = 8
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_trigger(pattern: str):
+    return regex.compile(pattern)
+
+
+def _trigger_matches(pattern, text: str, deadline: float) -> bool:
+    remaining = min(REGEX_SECONDS, deadline - time.monotonic())
+    if remaining <= 0:
+        return False
+    try:
+        return pattern.search(text[:MAX_MATCH_TEXT], timeout=remaining) is not None
+    except TimeoutError:
+        return False
+
+
 MAX_BACKTEST_MATCHES = 12
 MAX_BACKTEST_EXCERPT_CHARS = 600
 PROJECT_SESSIONS_BUFFER_ID = "project_sessions"
 SESSION_BUFFER_PREFIX = "ses_"
 MIN_SESSION_PREFIX_LENGTH = 8
-COMPACT_CACHE_VERSION = 3
 PROJECT_SESSION_RENDER_ATTR = "_project_session_memory_render"
 PROJECT_SESSION_INDEX_RENDER_ATTR = "_project_session_memory_index_render"
 CORE_SYSTEM_PROMPT = (
@@ -88,11 +107,10 @@ SESSION_SYSTEM_PROMPT = (
     "contiguous sequence of turns until you have enough context; do not stop at the first "
     "turn or treat it as a summary. If a recent turn depends on an older decision, "
     "continue downward into earlier turns. For an unusually long buffer, use grep only to "
-    "locate a relevant area, then read the surrounding turn blocks. Use the Source "
-    "Transcript path and entry/line pointers when omitted tool activity or full-session "
-    "detail is needed."
+    "locate a relevant area, then read the surrounding turn blocks. Source Commit and "
+    "Source Instance identify the exact canonical document; entry indices refer to that "
+    "document, not journal file lines. Use the canonical session loader for omitted detail."
 )
-DEFAULT_SYSTEM_PROMPT = f"{CORE_SYSTEM_PROMPT} {SESSION_SYSTEM_PROMPT}"
 
 
 def _config_enabled(value: Any) -> bool:
@@ -102,57 +120,9 @@ def _config_enabled(value: Any) -> bool:
 
 
 
-
-def _session_namespaces_supported() -> bool:
-    if StateBoundSpecialBufferNamespaceProvider is None:
-        return False
-    namespace_register = getattr(BufferManager, "register_special_buffer_namespace", None)
-    exact_register = getattr(BufferManager, "register_special_buffer", None)
-    if not callable(namespace_register) or not callable(exact_register):
-        return False
-    try:
-        return (
-            "replace" in inspect.signature(namespace_register).parameters
-            and "replace" in inspect.signature(exact_register).parameters
-        )
-    except (TypeError, ValueError):
-        return False
-
-
-
-
 def _register_exact_special_buffer(manager, buffer_id: str, provider: Any) -> None:
-    register = manager.register_special_buffer
-    try:
-        supports_replace = "replace" in inspect.signature(register).parameters
-    except (TypeError, ValueError):
-        supports_replace = False
-    if supports_replace:
-        register(buffer_id, provider, replace=True)
-        return
-    if manager.is_special(buffer_id):
-        providers = getattr(manager, "_special_buffers", None)
-        if isinstance(providers, dict):
-            providers[buffer_id] = provider
-            cache = getattr(manager, "_special_cache", None)
-            if isinstance(cache, dict):
-                cache.pop(buffer_id, None)
-            return
-    register(buffer_id, provider)
-
-
-_SESSION_NAMESPACE_WARNING_EMITTED = False
-
-
-def _warn_session_namespaces_unavailable() -> None:
-    global _SESSION_NAMESPACE_WARNING_EMITTED
-    if _SESSION_NAMESPACE_WARNING_EMITTED:
-        return
-    _SESSION_NAMESPACE_WARNING_EMITTED = True
-    log.warning(
-        "Project session buffers are disabled: the loaded Agent Utils build lacks "
-        "replaceable special-buffer namespace support. Core project-memory tools remain active."
-    )
+    """Replace one exact provider using the current BufferManager contract."""
+    manager.register_special_buffer(buffer_id, provider, replace=True)
 
 
 def _format_utc(value: Any) -> str:
@@ -187,6 +157,17 @@ def _session_key(session_id: str) -> str:
     return re.sub(r"[^0-9a-z]", "", str(session_id or "").lower())
 
 
+# Cheap issued identities live for the backend lifetime; text and work do not.
+MAX_PROJECT_SESSION_ROWS = 1000
+SESSION_LOAD_QUEUE_LIMIT = 8
+SESSION_PROJECTION_CACHE_BYTES = 4 * 1024 * 1024
+SESSION_OBSERVE_S = 0.2
+SESSION_WORKER_IDLE_S = 0.2
+SESSION_ERROR_CHARS = 300
+SESSION_INDEX_REFRESH_S = 5.0
+SESSION_LOAD_RETRY_S = 5.0
+
+
 def _session_buffer_ids(sessions: Sequence[Mapping[str, Any]]) -> dict[str, str]:
     keyed = {
         str(item.get("session_id") or ""): _session_key(str(item.get("session_id") or ""))
@@ -206,26 +187,18 @@ def _session_buffer_ids(sessions: Sequence[Mapping[str, Any]]) -> dict[str, str]
     return result
 
 
-def _load_session_index(path: Path) -> list[dict[str, Any]]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    if not isinstance(data, list):
-        return []
-    return [dict(item) for item in data if isinstance(item, Mapping)]
-
-
 def _session_source(project_dir: Path, session_id: str) -> Path:
-    if not session_id or Path(session_id).name != session_id or session_id in {".", ".."}:
+    """Return the logical session locator without touching shared storage."""
+    if (
+        not session_id
+        or "\x00" in session_id
+        or Path(session_id).name != session_id
+        or session_id in {".", ".."}
+    ):
         raise ValueError(f"Invalid session id: {session_id!r}")
-    sessions_root = (project_dir / "sessions").resolve()
-    source = (sessions_root / session_id / "session.json").resolve()
-    try:
-        source.relative_to(sessions_root)
-    except ValueError as exc:
-        raise ValueError(f"Session path escapes project: {session_id!r}") from exc
-    return source
+    # ``abspath`` is lexical here; unlike ``resolve`` it does not inspect a
+    # shared mount or follow a session directory while the pipeline is running.
+    return Path(os.path.abspath(os.fspath(Path(project_dir) / "sessions" / session_id / "session.json")))
 
 
 def _timestamp_sort_value(value: Any) -> float:
@@ -248,36 +221,39 @@ def _timestamp_sort_value(value: Any) -> float:
 
 
 def _eligible_project_sessions(
-    project_dir: Path,
+    entries: Sequence[Mapping[str, Any]],
     current_session_id: str,
 ) -> list[dict[str, Any]]:
-    sessions = []
+    """Filter only catalog metadata; never probe one shared row at a time."""
+    sessions: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in _load_session_index(project_dir / "sessions" / "index.json"):
+    current = str(current_session_id or "").strip()
+    for raw in entries:
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
         session_id = str(item.get("session_id") or "").strip()
         kind = str(item.get("kind") or "").strip().lower()
         if (
             not session_id
+            or "\x00" in session_id
+            or Path(session_id).name != session_id
             or session_id in seen
-            or session_id == current_session_id
+            or session_id == current
             or kind.startswith("rlm")
         ):
             continue
-        seen.add(session_id)
-        try:
-            source = _session_source(project_dir, session_id)
-        except ValueError:
-            continue
-        if not source.is_file():
-            continue
         item["session_id"] = session_id
-        item["source_transcript"] = str(source)
+        # Old rows may contain a mutable source path.  It is not inventory
+        # metadata and must never become the authority for a history buffer.
+        item.pop("source_transcript", None)
+        seen.add(session_id)
         sessions.append(item)
     sessions.sort(
-        key=lambda item: _timestamp_sort_value(item.get("updated_at")),
+        key=lambda item: (_timestamp_sort_value(item.get("updated_at")), str(item["session_id"])),
         reverse=True,
     )
-    return sessions
+    return sessions[:MAX_PROJECT_SESSION_ROWS]
 
 
 def _content_text(value: Any) -> str:
@@ -295,64 +271,8 @@ def _content_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _entry_line_ranges(source_text: str) -> dict[int, tuple[int, int]]:
-    ranges: dict[int, tuple[int, int]] = {}
-    in_entries = False
-    start_line: int | None = None
-    entry_index: int | None = None
-    index_pattern = re.compile(r'^\s{6}"index":\s*(-?\d+),?\s*$')
-    for line_number, line in enumerate(source_text.splitlines(), start=1):
-        stripped = line.rstrip("\r\n")
-        if not in_entries:
-            if stripped == '  "entries": [':
-                in_entries = True
-            continue
-        if start_line is None:
-            if stripped == "    {":
-                start_line = line_number
-                entry_index = None
-                continue
-            if stripped == "  ],":
-                break
-            continue
-        match = index_pattern.match(stripped)
-        if match:
-            entry_index = int(match.group(1))
-        if stripped in {"    },", "    }"}:
-            if entry_index is not None:
-                ranges[entry_index] = (start_line, line_number)
-            start_line = None
-            entry_index = None
-    return ranges
-
-
-def _entry_has_tool_activity(entry: Mapping[str, Any]) -> bool:
-    if entry.get("tool_calls"):
-        return True
-    for message in entry.get("messages") or []:
-        if not isinstance(message, Mapping):
-            continue
-        if str(message.get("role") or "") == "tool":
-            return True
-        if message.get("tool_calls") or message.get("provider_tool_calls"):
-            return True
-    return False
-
-
-def _role_text(entry: Mapping[str, Any], role: str) -> str:
-    parts = []
-    for message in entry.get("messages") or []:
-        if not isinstance(message, Mapping):
-            continue
-        if str(message.get("role") or "") != role:
-            continue
-        text = _content_text(message.get("content")).strip()
-        if text:
-            parts.append(text)
-    return "\n\n".join(parts)
-
-
 def _compact_turns(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Keep complete user/final-assistant turn blocks, oldest-to-newest."""
     turns: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     for position, entry in enumerate(entries):
@@ -393,6 +313,8 @@ def _compact_turns(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
             )
             if has_message_tool_calls or only_assistant_owns_entry_calls:
                 continue
+            # Later plain assistant messages in the same turn are the final
+            # answer for projection purposes.
             current["assistant_entry"] = entry_index
             current["assistant_text"] = text
     if current is not None:
@@ -400,44 +322,43 @@ def _compact_turns(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
     return turns
 
 
-def _entry_delimiter(role: str, entry_index: int, ranges: Mapping[int, tuple[int, int]]) -> str:
-    source_range = ranges.get(entry_index)
-    if source_range is None:
-        return f"{role} [entry {entry_index}]"
-    return f"{role} [entry {entry_index}, lines {source_range[0]}-{source_range[1]}]"
-
-
 def _build_compact_transcript(
     session: Mapping[str, Any],
-    source: Path,
+    document: Mapping[str, Any],
     *,
+    commit_id: str,
+    instance_id: str,
+    source_format: str,
     generated_at: float,
-    source_text: str | None = None,
 ) -> str:
-    if source_text is None:
-        source_text = source.read_text(encoding="utf-8")
-    document = json.loads(source_text)
+    """Project a validated canonical document without restoring opaque state.
+
+    Journals do not contain a standalone transcript JSON file. Entry indices are
+    canonical-document pointers, never fabricated journal-file line numbers.
+    """
     raw_entries = document.get("entries")
     if not isinstance(raw_entries, list):
         state = document.get("state")
         raw_entries = state.get("entries") if isinstance(state, Mapping) else []
     entries = [item for item in (raw_entries or []) if isinstance(item, Mapping)]
-    ranges = _entry_line_ranges(source_text)
     lines = [
         f"Session ID: {session['session_id']}",
         f"Title: {_one_line_text(session.get('title'), '(untitled)')}",
         f"Description: {_one_line_text(session.get('description'), '(none)')}",
-        f"Created (UTC): {_format_utc(session.get('created_at'))}",
-        f"Updated (UTC): {_format_utc(session.get('updated_at'))}",
+        f"Catalog Created (UTC): {_format_utc(session.get('created_at'))}",
+        f"Catalog Updated (UTC): {_format_utc(session.get('updated_at'))}",
         f"Buffer Generated (UTC): {_format_utc(generated_at)}",
         "Order: Newest turn first",
-        f"Source Transcript: {source.resolve()}",
+        f"Source Commit: {commit_id}",
+        f"Source Instance: {instance_id}",
+        f"Source Format: {source_format}",
+        "Entry pointers: canonical document indices, not journal file lines.",
     ]
     for turn in reversed(_compact_turns(entries)):
         lines.extend(
             [
                 "",
-                _entry_delimiter("USER", turn["user_entry"], ranges),
+                f"USER [entry {turn['user_entry']}]",
                 turn["user_text"],
             ]
         )
@@ -445,135 +366,39 @@ def _build_compact_transcript(
             lines.extend(
                 [
                     "",
-                    _entry_delimiter("ASSISTANT", turn["assistant_entry"], ranges),
+                    f"ASSISTANT [entry {turn['assistant_entry']}]",
                     turn["assistant_text"],
                 ]
             )
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _cache_path(project_dir: Path, session_id: str) -> Path:
-    raw_id = str(session_id or "")
-    readable = _session_key(raw_id)[:24] or "session"
-    digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:12]
-    return (
-        project_dir
-        / "plugin-data"
-        / "project-memory"
-        / "compact"
-        / f"{readable}-{digest}.json"
-    )
-
-
-def _source_stat_key(source_stat: os.stat_result) -> tuple[int, int, int, int]:
-    return (
-        source_stat.st_dev,
-        source_stat.st_ino,
-        source_stat.st_size,
-        source_stat.st_mtime_ns,
-    )
-
-
-def _read_source_snapshot(source: Path) -> tuple[str, os.stat_result]:
-    for _ in range(3):
-        before = source.stat()
-        source_text = source.read_text(encoding="utf-8")
-        after = source.stat()
-        if _source_stat_key(before) == _source_stat_key(after):
-            return source_text, after
-    raise OSError(f"Session transcript changed repeatedly while reading: {source}")
-
-
-def _session_cache_metadata(
-    session: Mapping[str, Any],
-    source: Path,
-    source_stat: os.stat_result,
-) -> dict[str, Any]:
-    return {
-        "version": COMPACT_CACHE_VERSION,
-        "source": str(source.resolve()),
-        "source_device": source_stat.st_dev,
-        "source_inode": source_stat.st_ino,
-        "source_size": source_stat.st_size,
-        "source_mtime_ns": source_stat.st_mtime_ns,
-        "title": str(session.get("title") or ""),
-        "description": str(session.get("description") or ""),
-        "created_at": session.get("created_at"),
-        "updated_at": session.get("updated_at"),
-    }
-
-
-def _read_compact_cache(path: Path, expected: Mapping[str, Any]) -> str | None:
-    try:
-        cached = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(cached, Mapping) or cached.get("metadata") != dict(expected):
-        return None
-    text = cached.get("text")
-    return text if isinstance(text, str) else None
-
-
-def _atomic_write_cache(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temp_path = Path(handle.name)
-            json.dump(payload, handle, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    finally:
-        if temp_path is not None:
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
-
-
-def _cached_compact_transcript(
-    project_dir: Path,
-    session: Mapping[str, Any],
-    source: Path,
-    *,
-    generated_at: float,
-) -> str:
-    cache = _cache_path(project_dir, str(session["session_id"]))
-    before = source.stat()
-    cached = _read_compact_cache(
-        cache,
-        _session_cache_metadata(session, source, before),
-    )
-    after = source.stat()
-    if cached is not None and _source_stat_key(before) == _source_stat_key(after):
-        return cached
-
-    source_text, source_stat = _read_source_snapshot(source)
-    metadata = _session_cache_metadata(session, source, source_stat)
-    text = _build_compact_transcript(
-        session,
-        source,
-        generated_at=generated_at,
-        source_text=source_text,
-    )
-    try:
-        _atomic_write_cache(cache, {"metadata": metadata, "text": text})
-    except OSError:
-        log.debug("Could not cache compact session transcript %s", source, exc_info=True)
-    return text
+def _bounded_history_error(error: object) -> str:
+    text = str(error or "").replace("\x00", " ").strip()
+    if len(text) > SESSION_ERROR_CHARS:
+        return text[:SESSION_ERROR_CHARS].rstrip() + "…"
+    return text or "unknown history read failure"
 
 
 class ProjectMemoryStore:
-    """Project-database storage component shared by all memory components."""
+    """Project-scoped filesystem memory storage with local-first publication.
+
+    The service-facing read path is deliberately cache-only.  Local CRUD writes
+    a durable overlay and operation record first; a single daemon worker later
+    refreshes the shared project store and publishes those operations with a
+    per-memory revision check.  The worker never mutates pipeline state.
+    """
+
+    _SCHEMA_VERSION = 1
+    _RECORD_NAMESPACE = "project_memory"
+    _OVERLAY_NAMESPACE = "project_memory_overlay"
+    _PENDING_NAMESPACE = "project_memory_pending"
+    _SNAPSHOT_NAMESPACE = "project_memory_snapshot"
+    _SNAPSHOT_META_KEY = "__meta__"
+    _REFRESH_INTERVAL_SECONDS = 5.0
+    _DEFAULT_LOCAL_RETRY_SECONDS = 1.0
+
+    optional_reads = {"_agent_zoo_context"}
 
     def __init__(
         self,
@@ -584,6 +409,31 @@ class ProjectMemoryStore:
             for key, value in (common_memories or {}).items()
             if isinstance(value, Mapping)
         }
+        self._lock = threading.RLock()
+        self._storage_lock = threading.RLock()
+        self._initialization_lock = threading.RLock()
+        self._local_store = None
+        self._local_root: Path | None = None
+        self._shared_root: Path | None = None
+        self._project_name = ""
+        self._runtime_key: tuple[str, str, str] | None = None
+        self._generation = 0
+        self._overlay: dict[str, dict[str, Any]] = {}
+        self._pending: dict[str, dict[str, Any]] = {}
+        self._latest_operation: dict[str, str] = {}
+        self._receipts: dict[str, dict[str, Any]] = {}
+        self._shared_snapshot: dict[str, dict[str, Any]] = {}
+        self._shared_ready = False
+        self._shared_status = "not_ready"
+        self._shared_error: str | None = None
+        self._snapshot_generation = 0
+        self._last_refresh_at: float | None = None
+        self._refresh_requested = False
+        self._last_refresh_request = 0.0
+        self._retry_at = 0.0
+        self._wake = threading.Event()
+        self._worker: threading.Thread | None = None
+        self._closed = False
 
     @staticmethod
     def _common_memory_id(registry_key: str) -> str:
@@ -631,138 +481,780 @@ class ProjectMemoryStore:
             None,
         )
 
-    optional_reads = {"run_db", "agent_db"}
-
-    def __call__(self, state):
-        # Startup and restore must not take a project-database write lock.
-        # CRUD methods create the schema lazily when a mutation is requested.
-        return state
+    @staticmethod
+    def _lexical_absolute(value: str | os.PathLike[str] | Path) -> Path:
+        return Path(os.path.abspath(os.path.expanduser(os.fspath(value))))
 
     @staticmethod
-    def _agent_db(state):
-        run_db = getattr(state, "run_db", None)
-        agent_db = getattr(run_db, "agent_db", None) or getattr(state, "agent_db", None)
-        if agent_db is None or not hasattr(agent_db, "conn"):
-            raise RuntimeError("project memory requires a live Agent Zoo project database")
-        return agent_db
+    def _default_local_root() -> Path:
+        uid = getattr(os, "getuid", lambda: 0)()
+        if sys.platform == "darwin":
+            base = Path("/private/var/tmp")
+        else:
+            base = Path("/var/tmp") if os.name == "posix" else Path(tempfile.gettempdir())
+        return base / f"agent-zoo-{uid}"
 
-    def ensure_schema(self, state):
-        conn = self._agent_db(state).conn
-        conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                id         TEXT PRIMARY KEY,
-                content    TEXT NOT NULL,
-                trigger    TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_updated_at "
-            f"ON {TABLE_NAME}(updated_at)"
-        )
-        conn.commit()
-        return conn
-
-    def _existing_schema(self, state):
-        conn = self._agent_db(state).conn
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-            (TABLE_NAME,),
-        ).fetchone()
-        return conn if exists is not None else None
+    def _runtime_paths(self, state) -> tuple[str, Path, Path, Path] | None:
+        context = dict(getattr(state, "_agent_zoo_context", {}) or {})
+        project_name = str(context.get("project_name") or "default").strip() or "default"
+        project_dir_raw = str(context.get("project_dir") or "").strip()
+        if not project_dir_raw:
+            index_raw = str(context.get("project_session_index") or "").strip()
+            if index_raw:
+                project_dir_raw = str(Path(index_raw).parent.parent)
+        if not project_dir_raw:
+            return None
+        project_dir = self._lexical_absolute(project_dir_raw)
+        shared_root = project_dir / "plugin-data" / "project-memory"
+        local_raw = os.environ.get("AGENT_ZOO_LOCAL_STATE_ROOT") or self._default_local_root()
+        local_base = self._lexical_absolute(local_raw)
+        digest = hashlib.sha256(str(shared_root).encode("utf-8")).hexdigest()
+        local_root = local_base / "project-memory" / digest
+        return project_name, project_dir, shared_root, local_root
 
     @staticmethod
-    def invalidate_buffer(state) -> None:
-        manager = getattr(state, "buffer_manager", None)
-        cache = getattr(manager, "_special_cache", None)
-        if isinstance(cache, dict):
-            cache.pop("project_memory", None)
+    def _open_record_store(root: Path, *, create: bool):
+        try:
+            from tmux_pilot.fs_store import RecordStore
+        except ImportError as exc:  # pragma: no cover - packaging failure
+            raise RuntimeError("filesystem memory storage requires tmux-pilot RecordStore") from exc
+        return RecordStore(root, create=create)
 
     @staticmethod
-    def _validate_content(content: str) -> str:
+    def _compile_trigger(pattern: str):
+        return regex.compile(pattern)
+
+    @classmethod
+    def _validate_content(cls, content: str) -> str:
         text = str(content or "").strip()
         if not text:
             raise ValueError("memory content must not be empty")
         return text
 
-    @staticmethod
-    def _validate_trigger(trigger: str) -> str:
+    @classmethod
+    def _validate_trigger(cls, trigger: str) -> str:
         pattern = str(trigger or "").strip()
         if not pattern:
             raise ValueError("memory trigger must not be empty")
         try:
-            re.compile(pattern)
-        except re.error as exc:
+            cls._compile_trigger(pattern)
+        except Exception as exc:
             raise ValueError(f"invalid memory trigger regex: {exc}") from exc
         return pattern
 
+    @classmethod
+    def _normalize_record(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        fallback_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValueError("filesystem memory record must be an object")
+        memory_id = str(value.get("id") or value.get("memory_id") or fallback_id or "").strip()
+        if not memory_id:
+            raise ValueError("filesystem memory record has no id")
+        deleted = bool(value.get("deleted", False))
+        content = str(value.get("content") or "")
+        trigger = str(value.get("trigger") or "")
+        if not deleted:
+            if not content.strip():
+                raise ValueError(f"filesystem memory {memory_id!r} has empty content")
+            if not trigger.strip():
+                raise ValueError(f"filesystem memory {memory_id!r} has empty trigger")
+            cls._compile_trigger(trigger)
+        try:
+            revision = int(value.get("revision", 1))
+            created_at = float(value.get("created_at"))
+            updated_at = float(value.get("updated_at"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"filesystem memory {memory_id!r} has invalid timestamps or revision") from exc
+        if revision < 1:
+            raise ValueError(f"filesystem memory {memory_id!r} has invalid revision")
+        operation_id = str(value.get("operation_id") or value.get("op_id") or "").strip()
+        return {
+            "schema_version": int(value.get("schema_version", cls._SCHEMA_VERSION)),
+            "id": memory_id,
+            "content": content,
+            "trigger": trigger,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "revision": revision,
+            "deleted": deleted,
+            "operation_id": operation_id,
+        }
+
     @staticmethod
-    def _memory_from_row(row) -> dict[str, Any] | None:
-        if row is None:
+    def _public_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+        if bool(record.get("deleted", False)):
             return None
         return {
-            "id": str(row["id"]),
-            "content": str(row["content"]),
-            "trigger": str(row["trigger"]),
-            "created_at": float(row["created_at"]),
-            "updated_at": float(row["updated_at"]),
+            "id": str(record["id"]),
+            "content": str(record["content"]),
+            "trigger": str(record["trigger"]),
+            "created_at": float(record["created_at"]),
+            "updated_at": float(record["updated_at"]),
         }
+
+    @staticmethod
+    def _record_equal(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+        fields = (
+            "id",
+            "content",
+            "trigger",
+            "created_at",
+            "updated_at",
+            "revision",
+            "deleted",
+            "operation_id",
+        )
+        return all(left.get(field) == right.get(field) for field in fields)
+
+    @staticmethod
+    def _bounded_error(exc: object) -> str:
+        text = f"{type(exc).__name__}: {exc}".strip()
+        return text[:400]
+
+    def _persist_snapshot(self, snapshot: Mapping[str, Mapping[str, Any]]) -> None:
+        with self._lock:
+            local_store = self._local_store
+            records = {str(key): dict(value) for key, value in snapshot.items()}
+        if local_store is None:
+            raise RuntimeError("project memory local storage is unavailable")
+        with self._storage_lock:
+            for memory_id, incoming in records.items():
+                def merge(current, _incoming=incoming, _memory_id=memory_id):
+                    if current is None:
+                        return _incoming
+                    if not isinstance(current, Mapping):
+                        return current
+                    try:
+                        existing = self._normalize_record(current, fallback_id=_memory_id)
+                    except (TypeError, ValueError):
+                        return current
+                    incoming_revision = int(_incoming.get("revision", 0) or 0)
+                    existing_revision = int(existing.get("revision", 0) or 0)
+                    if existing_revision > incoming_revision:
+                        return existing
+                    if existing_revision == incoming_revision and str(
+                        existing.get("operation_id") or ""
+                    ) != str(_incoming.get("operation_id") or ""):
+                        return existing
+                    return _incoming
+
+                local_store.update(self._SNAPSHOT_NAMESPACE, memory_id, merge)
+            local_store.put(
+                self._SNAPSHOT_NAMESPACE,
+                self._SNAPSHOT_META_KEY,
+                {
+                    "schema_version": self._SCHEMA_VERSION,
+                    "kind": "last_good_snapshot",
+                    "saved_at": time.time(),
+                },
+            )
+
+    def _load_local_records(
+        self,
+        local_store,
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        dict[str, dict[str, Any]],
+        dict[str, dict[str, Any]],
+        bool,
+    ]:
+        pending: dict[str, dict[str, Any]] = {}
+        overlay: dict[str, dict[str, Any]] = {}
+        snapshot: dict[str, dict[str, Any]] = {}
+        snapshot_present = False
+        for key, raw in local_store.items(self._SNAPSHOT_NAMESPACE):
+            if key == self._SNAPSHOT_META_KEY:
+                if isinstance(raw, Mapping) and raw.get("kind") == "last_good_snapshot":
+                    snapshot_present = True
+                continue
+            if not isinstance(raw, Mapping):
+                continue
+            try:
+                record = self._normalize_record(raw, fallback_id=str(key))
+            except (TypeError, ValueError):
+                log.warning("Ignoring malformed durable project-memory snapshot record")
+                continue
+            snapshot_present = True
+            snapshot[str(record["id"])] = record
+        for key, raw in local_store.items(self._PENDING_NAMESPACE):
+            if not isinstance(raw, Mapping):
+                continue
+            op_id = str(raw.get("operation_id") or key or "").strip()
+            memory_id = str(raw.get("memory_id") or "").strip()
+            desired = raw.get("record")
+            if not op_id or not memory_id or not isinstance(desired, Mapping):
+                continue
+            try:
+                record = self._normalize_record(desired, fallback_id=memory_id)
+            except (TypeError, ValueError):
+                log.warning("Ignoring malformed local project-memory operation %s", op_id)
+                continue
+            operation = dict(raw)
+            operation["operation_id"] = op_id
+            operation["memory_id"] = memory_id
+            operation["record"] = record
+            operation["status"] = str(raw.get("status") or "pending")
+            pending[op_id] = operation
+        for key, raw in local_store.items(self._OVERLAY_NAMESPACE):
+            candidate = raw.get("record") if isinstance(raw, Mapping) else raw
+            if not isinstance(candidate, Mapping):
+                continue
+            try:
+                record = self._normalize_record(candidate, fallback_id=str(key))
+            except (TypeError, ValueError):
+                log.warning("Ignoring malformed local project-memory overlay %s", key)
+                continue
+            overlay[str(record["id"])] = record
+        for operation in sorted(
+            pending.values(),
+            key=lambda item: (
+                float(item.get("created_at", 0.0) or 0.0),
+                str(item["operation_id"]),
+            ),
+        ):
+            if operation.get("status") not in {"pending", "conflict"}:
+                continue
+            overlay[str(operation["memory_id"])] = dict(operation["record"])
+        return pending, overlay, snapshot, snapshot_present
+
+    def _set_unavailable(self, error: object) -> None:
+        with self._lock:
+            self._shared_status = "unavailable"
+            self._shared_error = self._bounded_error(error)
+            self._last_refresh_at = time.time()
+
+    def _ensure_runtime(self, state) -> bool:
+        paths = self._runtime_paths(state)
+        if paths is None:
+            self._set_unavailable(RuntimeError("Agent Zoo project context is unavailable"))
+            return False
+        project_name, _project_dir, shared_root, local_root = paths
+        key = (project_name, str(shared_root), str(local_root))
+        with self._lock:
+            if self._runtime_key == key and self._local_store is not None:
+                return True
+        with self._initialization_lock:
+            with self._lock:
+                if self._runtime_key == key and self._local_store is not None:
+                    return True
+            try:
+                local_store = self._open_record_store(local_root, create=True)
+                pending, overlay, snapshot, snapshot_present = self._load_local_records(local_store)
+            except Exception as exc:
+                self._set_unavailable(exc)
+                return False
+            with self._lock:
+                self._generation += 1
+                self._runtime_key = key
+                self._project_name = project_name
+                self._shared_root = shared_root
+                self._local_root = local_root
+                self._local_store = local_store
+                self._pending = pending
+                self._overlay = overlay
+                self._latest_operation = {}
+                self._receipts = {}
+                for operation in sorted(
+                    pending.values(),
+                    key=lambda item: (float(item.get("created_at", 0.0) or 0.0), str(item["operation_id"])),
+                ):
+                    memory_id = str(operation["memory_id"])
+                    op_id = str(operation["operation_id"])
+                    self._latest_operation[memory_id] = op_id
+                    self._receipts[op_id] = self._receipt_for_operation(
+                        operation,
+                        status={"conflict": "conflict", "published": "shared"}.get(operation.get("status"), "local_queued"),
+                        shared_saved=operation.get("status") == "published",
+                        error=operation.get("error"),
+                        observed=operation.get("conflict_record"),
+                    )
+                self._shared_snapshot = snapshot
+                self._shared_ready = bool(snapshot_present)
+                self._shared_status = "cached" if snapshot_present else "not_ready"
+                self._shared_error = None
+                self._snapshot_generation = 1 if snapshot_present else 0
+                self._last_refresh_at = None
+                self._last_refresh_request = time.monotonic()
+                self._refresh_requested = True
+                self._wake.set()
+                self._start_worker_locked(self._generation)
+            return True
+
+    def _start_worker_locked(self, generation: int) -> None:
+        if self._closed:
+            return
+        if self._worker is not None and self._worker.is_alive():
+            return
+        worker = threading.Thread(
+            target=self._worker_loop,
+            args=(generation,),
+            name="azo-project-memory-sync",
+            daemon=True,
+        )
+        self._worker = worker
+        worker.start()
+
+    def _request_work(self, *, refresh: bool = False) -> None:
+        with self._lock:
+            if self._local_store is None or self._closed:
+                return
+            if refresh:
+                now = time.monotonic()
+                if (
+                    not self._refresh_requested
+                    and now - self._last_refresh_request >= self._REFRESH_INTERVAL_SECONDS
+                ):
+                    self._refresh_requested = True
+                    self._last_refresh_request = now
+            self._wake.set()
+            self._start_worker_locked(self._generation)
+
+    @property
+    def worker_alive(self) -> bool:
+        with self._lock:
+            return bool(self._worker is not None and self._worker.is_alive())
+
+    def close(self, timeout_s: float = 0.25) -> None:
+        with self._lock:
+            self._closed = True
+            self._wake.set()
+            worker = self._worker
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=max(0.0, float(timeout_s)))
+
+    def __call__(self, state):
+        self._ensure_runtime(state)
+        self._request_work(refresh=True)
+        return state
+
+    def snapshot_status(self, state=None) -> dict[str, Any]:
+        if state is not None:
+            self._ensure_runtime(state)
+            self._request_work(refresh=True)
+        with self._lock:
+            conflicts = sorted(
+                str(operation.get("memory_id") or "")
+                for operation in self._pending.values()
+                if operation.get("status") == "conflict"
+            )
+            return {
+                "project": self._project_name,
+                "ready": bool(self._shared_ready),
+                "last_good": bool(self._shared_ready),
+                "status": self._shared_status,
+                "shared_status": self._shared_status,
+                "shared_available": self._shared_status in {"ready", "empty"},
+                "cache_only": True,
+                "snapshot_generation": self._snapshot_generation,
+                "last_refresh_at": self._last_refresh_at,
+                "pending_operations": sum(
+                    1 for operation in self._pending.values() if operation.get("status") in {"pending", "published"}
+                ),
+                "conflicts": conflicts,
+                "error": self._shared_error,
+            }
+
+    # Alias with a short name for recall/buffer integrations.
+    status = snapshot_status
+
+    def _worker_loop(self, generation: int) -> None:
+        try:
+            while True:
+                with self._lock:
+                    if generation != self._generation or self._closed:
+                        return
+                    refresh = self._refresh_requested
+                    self._refresh_requested = False
+                    operation_id = self._next_operation_locked()
+                if refresh:
+                    self._refresh_shared(generation)
+                if operation_id is not None:
+                    self._publish_operation(operation_id, generation)
+                    continue
+                with self._lock:
+                    if generation != self._generation or self._closed:
+                        return
+                    pending_exists = any(
+                        operation.get("status") in {"pending", "published"}
+                        for operation in self._pending.values()
+                    )
+                    refresh_pending = self._refresh_requested
+                    retry_at = self._retry_at
+                if not pending_exists and not refresh_pending:
+                    return
+                timeout = 0.5
+                if retry_at > time.monotonic():
+                    timeout = min(timeout, retry_at - time.monotonic())
+                self._wake.wait(timeout=max(0.01, timeout))
+                self._wake.clear()
+        finally:
+            with self._lock:
+                if self._worker is threading.current_thread():
+                    self._worker = None
+
+    def _next_operation_locked(self) -> str | None:
+        now = time.monotonic()
+        if now < self._retry_at:
+            return None
+        ordered = sorted(
+            self._pending.values(),
+            key=lambda item: (float(item.get("created_at", 0.0) or 0.0), str(item["operation_id"])),
+        )
+        pending_ids = set(self._pending)
+        for operation in ordered:
+            if operation.get("status") not in {"pending", "published"}:
+                continue
+            previous = str(operation.get("previous_operation_id") or "").strip()
+            if previous and previous in pending_ids:
+                continue
+            return str(operation["operation_id"])
+        return None
+
+    def _retain_last_good_for_missing_shared(self, generation: int) -> bool:
+        with self._lock:
+            if generation != self._generation:
+                return True
+            if not self._shared_ready:
+                return False
+            self._shared_status = "unavailable"
+            self._shared_error = "shared project-memory root is unavailable"
+            self._last_refresh_at = time.time()
+            return True
+
+    def _refresh_shared(self, generation: int) -> None:
+        with self._lock:
+            if generation != self._generation or self._shared_root is None:
+                return
+            root = self._shared_root
+        try:
+            try:
+                root.lstat()
+            except FileNotFoundError:
+                if self._retain_last_good_for_missing_shared(generation):
+                    return
+                snapshot: dict[str, dict[str, Any]] = {}
+                shared_status = "empty"
+            else:
+                shared_store = self._open_record_store(root, create=False)
+                snapshot = {}
+                for key, raw in shared_store.items(self._RECORD_NAMESPACE):
+                    record = self._normalize_record(raw, fallback_id=str(key))
+                    snapshot[str(record["id"])] = record
+                shared_status = "ready" if any(
+                    not bool(record.get("deleted", False)) for record in snapshot.values()
+                ) else "empty"
+        except FileNotFoundError:
+            if self._retain_last_good_for_missing_shared(generation):
+                return
+            snapshot = {}
+            shared_status = "empty"
+        except Exception as exc:
+            with self._lock:
+                if generation == self._generation:
+                    self._shared_status = "unavailable"
+                    self._shared_error = self._bounded_error(exc)
+                    self._last_refresh_at = time.time()
+            return
+
+        with self._lock:
+            if generation != self._generation:
+                return
+            prior_snapshot = {key: dict(value) for key, value in self._shared_snapshot.items()}
+        merged_snapshot = dict(prior_snapshot)
+        for memory_id, incoming in snapshot.items():
+            existing = merged_snapshot.get(memory_id)
+            if existing is None:
+                merged_snapshot[memory_id] = dict(incoming)
+                continue
+            existing_revision = int(existing.get("revision", 0) or 0)
+            incoming_revision = int(incoming.get("revision", 0) or 0)
+            if existing_revision > incoming_revision:
+                continue
+            if existing_revision == incoming_revision and str(
+                existing.get("operation_id") or ""
+            ) != str(incoming.get("operation_id") or ""):
+                continue
+            merged_snapshot[memory_id] = dict(incoming)
+        snapshot = merged_snapshot
+        shared_status = "ready" if any(
+            not bool(record.get("deleted", False)) for record in snapshot.values()
+        ) else "empty"
+
+        snapshot_error = None
+        try:
+            self._persist_snapshot(snapshot)
+        except Exception as exc:
+            snapshot_error = exc
+            log.debug("could not persist project-memory last-good snapshot", exc_info=True)
+        reconcile: list[str] = []
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._shared_snapshot = snapshot
+            self._shared_ready = True
+            self._shared_status = shared_status
+            self._shared_error = None if snapshot_error is None else self._bounded_error(snapshot_error)
+            self._snapshot_generation += 1
+            self._last_refresh_at = time.time()
+            for op_id, operation in self._pending.items():
+                remote = snapshot.get(str(operation.get("memory_id") or ""))
+                desired = operation.get("record")
+                if (
+                    operation.get("status") in {"pending", "conflict"}
+                    and isinstance(remote, Mapping)
+                    and isinstance(desired, Mapping)
+                    and self._record_equal(remote, desired)
+                    and str(remote.get("operation_id") or "") == op_id
+                ):
+                    reconcile.append(op_id)
+        for op_id in reconcile:
+            self._finish_published(op_id, generation)
+
+    def _receipt_for_operation(
+        self,
+        operation: Mapping[str, Any],
+        *,
+        status: str,
+        error: object = None,
+        observed: Mapping[str, Any] | None = None,
+        shared_saved: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "operation_id": str(operation.get("operation_id") or ""),
+            "memory_id": str(operation.get("memory_id") or ""),
+            "operation": str(operation.get("operation") or ""),
+            "expected_revision": int(operation.get("expected_revision", 0) or 0),
+            "expected_operation_id": str(operation.get("expected_operation_id") or ""),
+            "revision": int((operation.get("record") or {}).get("revision", 0) or 0),
+            "local_saved": True,
+            "shared_saved": bool(shared_saved),
+            "status": status,
+            "observed_revision": (
+                int(observed.get("revision", 0) or 0)
+                if isinstance(observed, Mapping) and observed.get("revision") is not None
+                else None
+            ),
+            "error": None if error is None else self._bounded_error(error),
+        }
+
+    def receipt(self, memory_id: str) -> dict[str, Any] | None:
+        memory_id = str(memory_id or "").strip()
+        with self._lock:
+            op_id = self._latest_operation.get(memory_id)
+            if op_id and op_id in self._receipts:
+                return dict(self._receipts[op_id])
+            candidates = [
+                receipt
+                for receipt in self._receipts.values()
+                if receipt.get("memory_id") == memory_id
+            ]
+            if not candidates:
+                return None
+            return dict(candidates[-1])
+
+    def receipt_text(self, memory_id: str) -> str:
+        receipt = self.receipt(memory_id)
+        if not receipt:
+            return ""
+        status = str(receipt.get("status") or "")
+        if status == "shared":
+            return "Persistence: shared."
+        if status == "conflict":
+            detail = receipt.get("error") or "shared revision changed; local edit retained"
+            return f"Persistence: conflict; shared memory was not overwritten ({detail})."
+        if status == "local_queued":
+            detail = receipt.get("error")
+            suffix = f" ({detail})" if detail else ""
+            return f"Persistence: local queued; shared publication is pending{suffix}."
+        if status == "unsaved":
+            return f"Persistence: unsaved ({receipt.get('error') or 'local storage unavailable'})."
+        return f"Persistence: {status or 'unknown'}."
+
+    def _current_record_locked(self, memory_id: str) -> dict[str, Any] | None:
+        overlay = self._overlay.get(memory_id)
+        if overlay is not None:
+            return dict(overlay)
+        shared = self._shared_snapshot.get(memory_id)
+        return None if shared is None else dict(shared)
+
+    def _list_records_locked(self) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {
+            key: dict(value) for key, value in self._shared_snapshot.items()
+        }
+        merged.update({key: dict(value) for key, value in self._overlay.items()})
+        result = []
+        for record in merged.values():
+            public = self._public_record(record)
+            if public is not None:
+                result.append(public)
+        result.sort(key=lambda item: (float(item.get("created_at", 0.0)), str(item["id"])))
+        return result
 
     def get(self, state, memory_id: str) -> dict[str, Any] | None:
         memory_id = str(memory_id or "").strip()
-        conn = self._existing_schema(state)
-        if conn is None:
-            return self.get_common(memory_id)
-        row = conn.execute(
-            f"SELECT id, content, trigger, created_at, updated_at "
-            f"FROM {TABLE_NAME} WHERE id = ?",
-            (memory_id,),
-        ).fetchone()
-        memory = self._memory_from_row(row)
-        return memory if memory is not None else self.get_common(memory_id)
+        self._ensure_runtime(state)
+        self._request_work(refresh=True)
+        with self._lock:
+            current = self._current_record_locked(memory_id)
+            public = None if current is None else self._public_record(current)
+        return public if public is not None else self.get_common(memory_id)
 
     def list_all(self, state) -> list[dict[str, Any]]:
-        conn = self._existing_schema(state)
-        if conn is None:
-            return []
-        rows = conn.execute(
-            f"SELECT id, content, trigger, created_at, updated_at "
-            f"FROM {TABLE_NAME} ORDER BY created_at, id"
-        ).fetchall()
-        return [self._memory_from_row(row) for row in rows]
+        """Return the last-good shared snapshot plus local overlay, without shared I/O."""
+        self._ensure_runtime(state)
+        self._request_work(refresh=True)
+        with self._lock:
+            return self._list_records_locked()
+
+    def _reserve_memory_id_locked(self) -> str:
+        reserved_ids = {
+            memory["id"] for memory in self.list_common()
+        }
+        reserved_ids.update(self._shared_snapshot)
+        reserved_ids.update(self._overlay)
+        for _attempt in range(64):
+            memory_id = f"mem_{secrets.token_hex(3)}"
+            if memory_id not in reserved_ids:
+                return memory_id
+        raise RuntimeError("could not allocate a unique project memory id")
+
+    def _queue_operation(
+        self,
+        state,
+        *,
+        memory_id: str,
+        operation_name: str,
+        expected_revision: int,
+        record: Mapping[str, Any],
+        expected_operation_id: str = "",
+        previous_operation_id: str = "",
+        supersede_operation_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        if not self._ensure_runtime(state):
+            raise RuntimeError("project memory local storage is unavailable")
+        operation_id = f"op_{uuid.uuid4().hex}"
+        desired = dict(record)
+        desired["operation_id"] = operation_id
+        desired = self._normalize_record(desired, fallback_id=memory_id)
+        operation = {
+            "schema_version": self._SCHEMA_VERSION,
+            "operation_id": operation_id,
+            "memory_id": memory_id,
+            "operation": operation_name,
+            "expected_revision": int(expected_revision),
+            "expected_operation_id": str(expected_operation_id or ""),
+            "previous_operation_id": str(previous_operation_id or ""),
+            "created_at": time.time(),
+            "status": "pending",
+            "record": desired,
+        }
+        superseded = {str(item) for item in supersede_operation_ids if str(item)}
+        with self._storage_lock:
+            local_store = self._local_store
+            if local_store is None:
+                raise RuntimeError("project memory local storage is unavailable")
+            local_store.put(self._PENDING_NAMESPACE, operation_id, operation)
+            local_store.put(
+                self._OVERLAY_NAMESPACE,
+                memory_id,
+                {"schema_version": self._SCHEMA_VERSION, "record": desired},
+            )
+            for old_id in superseded:
+                old = self._pending.get(old_id)
+                if old is not None:
+                    old = dict(old)
+                    old["status"] = "superseded"
+                    old["superseded_by"] = operation_id
+                    try:
+                        local_store.put(self._PENDING_NAMESPACE, old_id, old)
+                        local_store.delete(self._PENDING_NAMESPACE, old_id)
+                    except Exception:
+                        log.debug("could not clear superseded project-memory operation %s", old_id, exc_info=True)
+        with self._lock:
+            for old_id in superseded:
+                old = self._pending.pop(old_id, None)
+                if old is not None:
+                    old_receipt = self._receipt_for_operation(old, status="superseded")
+                    old_receipt["superseded_by"] = operation_id
+                    self._receipts[old_id] = old_receipt
+            self._pending[operation_id] = operation
+            self._overlay[memory_id] = desired
+            self._latest_operation[memory_id] = operation_id
+            self._receipts[operation_id] = self._receipt_for_operation(
+                operation, status="local_queued"
+            )
+            public = self._public_record(desired)
+        self._request_work()
+        self.invalidate_buffer(state)
+        if public is None:
+            return {"id": memory_id, "content": "", "trigger": "", "created_at": desired["created_at"], "updated_at": desired["updated_at"]}
+        return public
 
     def create(self, state, content: str, trigger: str) -> dict[str, Any]:
         content = self._validate_content(content)
         trigger = self._validate_trigger(trigger)
-        conn = self.ensure_schema(state)
-        now = time.time()
-        reserved_ids = {memory["id"] for memory in self.list_common()}
-        for _attempt in range(32):
-            memory_id = f"mem_{secrets.token_hex(3)}"
-            if memory_id in reserved_ids:
-                continue
-            try:
-                conn.execute(
-                    f"INSERT INTO {TABLE_NAME} "
-                    "(id, content, trigger, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                    (memory_id, content, trigger, now, now),
-                )
-                conn.commit()
-                memory = {
-                    "id": memory_id,
-                    "content": content,
-                    "trigger": trigger,
-                    "created_at": now,
-                    "updated_at": now,
-                }
-                self.invalidate_buffer(state)
-                return memory
-            except sqlite3.IntegrityError:
-                continue
-        raise RuntimeError("could not allocate a unique project memory id")
+        self._ensure_runtime(state)
+        with self._lock:
+            memory_id = self._reserve_memory_id_locked()
+            now = time.time()
+            record = {
+                "id": memory_id,
+                "content": content,
+                "trigger": trigger,
+                "created_at": now,
+                "updated_at": now,
+                "revision": 1,
+                "deleted": False,
+            }
+        return self._queue_operation(
+            state,
+            memory_id=memory_id,
+            operation_name="create",
+            expected_revision=0,
+            record=record,
+        )
+
+    def _conflict_resolution_base_locked(
+        self,
+        memory_id: str,
+        current: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], tuple[str, ...]] | None:
+        operation_id = str(current.get("operation_id") or "")
+        operation = self._pending.get(operation_id)
+        visited: set[str] = set()
+        conflict_operation = None
+        while operation is not None and operation_id not in visited:
+            visited.add(operation_id)
+            if operation.get("status") == "conflict":
+                conflict_operation = operation
+                break
+            operation_id = str(operation.get("previous_operation_id") or "")
+            if not operation_id:
+                break
+            operation = self._pending.get(operation_id)
+        if conflict_operation is None:
+            return None
+        observed = conflict_operation.get("conflict_record")
+        if not isinstance(observed, Mapping):
+            raise RuntimeError(
+                f"project memory {memory_id!r} has an unresolved conflict without observed shared state"
+            )
+        base = self._normalize_record(observed, fallback_id=memory_id)
+        # A normal update/delete is the explicit resolution boundary.  Abandon
+        # every local descendant for this memory, including a tombstone, before
+        # publishing the new operation against the observed shared revision.
+        supersede = tuple(
+            str(item.get("operation_id") or "")
+            for item in self._pending.values()
+            if str(item.get("memory_id") or "") == memory_id
+            and item.get("status") in {"pending", "conflict"}
+            and str(item.get("operation_id") or "")
+        )
+        return base, supersede
 
     def update(
         self,
@@ -777,28 +1269,46 @@ class ProjectMemoryStore:
             raise ValueError(
                 f"configured common memory {memory_id!r} is read-only; edit the YAML registry"
             )
-        current = self.get(state, memory_id)
-        if current is None:
-            raise KeyError(f"unknown project memory {memory_id!r}")
         if content is None and trigger is None:
             raise ValueError("update_memory requires content and/or trigger")
-        next_content = current["content"] if content is None else self._validate_content(content)
-        next_trigger = current["trigger"] if trigger is None else self._validate_trigger(trigger)
-        now = time.time()
-        conn = self.ensure_schema(state)
-        conn.execute(
-            f"UPDATE {TABLE_NAME} SET content = ?, trigger = ?, updated_at = ? WHERE id = ?",
-            (next_content, next_trigger, now, memory_id),
+        self._ensure_runtime(state)
+        supersede: tuple[str, ...] = ()
+        with self._lock:
+            current = self._current_record_locked(memory_id)
+            if current is None:
+                raise KeyError(f"unknown project memory {memory_id!r}")
+            resolution = self._conflict_resolution_base_locked(memory_id, current)
+            if resolution is not None:
+                current, supersede = resolution
+            if bool(current.get("deleted", False)):
+                raise KeyError(f"unknown project memory {memory_id!r}")
+            next_content = current["content"] if content is None else self._validate_content(content)
+            next_trigger = current["trigger"] if trigger is None else self._validate_trigger(trigger)
+            now = time.time()
+            expected = int(current.get("revision", 0) or 0)
+            expected_operation_id = str(current.get("operation_id") or "")
+            previous = ""
+            if not supersede and expected_operation_id in self._pending:
+                previous = expected_operation_id
+            record = {
+                "id": memory_id,
+                "content": next_content,
+                "trigger": next_trigger,
+                "created_at": float(current["created_at"]),
+                "updated_at": now,
+                "revision": expected + 1,
+                "deleted": False,
+            }
+        return self._queue_operation(
+            state,
+            memory_id=memory_id,
+            operation_name="update",
+            expected_revision=expected,
+            record=record,
+            expected_operation_id=expected_operation_id,
+            previous_operation_id=previous,
+            supersede_operation_ids=supersede,
         )
-        conn.commit()
-        memory = {
-            **current,
-            "content": next_content,
-            "trigger": next_trigger,
-            "updated_at": now,
-        }
-        self.invalidate_buffer(state)
-        return memory
 
     def delete(self, state, memory_id: str) -> bool:
         memory_id = str(memory_id or "").strip()
@@ -806,20 +1316,261 @@ class ProjectMemoryStore:
             raise ValueError(
                 f"configured common memory {memory_id!r} is read-only; edit the YAML registry"
             )
-        conn = self.ensure_schema(state)
-        cursor = conn.execute(f"DELETE FROM {TABLE_NAME} WHERE id = ?", (memory_id,))
-        conn.commit()
-        deleted = bool(cursor.rowcount)
-        if deleted:
-            self.invalidate_buffer(state)
-        return deleted
+        self._ensure_runtime(state)
+        supersede: tuple[str, ...] = ()
+        with self._lock:
+            current = self._current_record_locked(memory_id)
+            if current is None:
+                return False
+            resolution = self._conflict_resolution_base_locked(memory_id, current)
+            if resolution is not None:
+                current, supersede = resolution
+            if bool(current.get("deleted", False)):
+                return False
+            expected = int(current.get("revision", 0) or 0)
+            expected_operation_id = str(current.get("operation_id") or "")
+            previous = ""
+            if not supersede and expected_operation_id in self._pending:
+                previous = expected_operation_id
+            record = {
+                "id": memory_id,
+                "content": str(current.get("content") or ""),
+                "trigger": str(current.get("trigger") or ""),
+                "created_at": float(current["created_at"]),
+                "updated_at": time.time(),
+                "revision": expected + 1,
+                "deleted": True,
+            }
+        self._queue_operation(
+            state,
+            memory_id=memory_id,
+            operation_name="delete",
+            expected_revision=expected,
+            record=record,
+            expected_operation_id=expected_operation_id,
+            previous_operation_id=previous,
+            supersede_operation_ids=supersede,
+        )
+        return True
+
+    def _publish_operation(self, operation_id: str, generation: int) -> None:
+        with self._lock:
+            if generation != self._generation:
+                return
+            operation = self._pending.get(operation_id)
+            root = self._shared_root
+        if operation is None or root is None or operation.get("status") not in {"pending", "published"}:
+            return
+        if operation["status"] == "published":
+            return self._finish_published(operation_id, generation)
+        desired = dict(operation["record"])
+        memory_id = str(operation["memory_id"])
+        outcome: dict[str, Any] = {}
+
+        def mutate(current):
+            current_record = None
+            if current is not None:
+                current_record = self._normalize_record(current, fallback_id=memory_id)
+            if current_record is not None and str(current_record.get("operation_id") or "") == operation_id:
+                if self._record_equal(current_record, desired):
+                    outcome["status"] = "published"
+                else:
+                    outcome["status"] = "conflict"
+                    outcome["current"] = current_record
+                return current_record
+            expected = int(operation.get("expected_revision", 0) or 0)
+            expected_operation_id = str(operation.get("expected_operation_id") or "")
+            current_revision = 0 if current_record is None else int(current_record.get("revision", 0) or 0)
+            current_operation_id = "" if current_record is None else str(current_record.get("operation_id") or "")
+            if current_revision != expected or current_operation_id != expected_operation_id:
+                outcome["status"] = "conflict"
+                outcome["current"] = current_record
+                return current_record
+            outcome["status"] = "published"
+            return desired
+
+        try:
+            shared_store = self._open_record_store(root, create=True)
+            shared_store.update(self._RECORD_NAMESPACE, memory_id, mutate)
+            if outcome.get("status") == "conflict":
+                self._mark_conflict(operation_id, generation, outcome.get("current"))
+            else:
+                self._finish_published(operation_id, generation)
+        except Exception as exc:
+            verified, current = self._verify_shared_after_error(root, memory_id, desired)
+            if verified:
+                self._finish_published(operation_id, generation, cleanup_error=exc)
+            elif isinstance(current, Mapping) and (
+                int(current.get("revision", 0) or 0) != int(operation.get("expected_revision", 0) or 0)
+                or str(current.get("operation_id") or "")
+                != str(operation.get("expected_operation_id") or "")
+            ):
+                self._mark_conflict(operation_id, generation, current, error=exc)
+            else:
+                with self._lock:
+                    self._retry_at = time.monotonic() + self._DEFAULT_LOCAL_RETRY_SECONDS
+                self._mark_unavailable(operation_id, generation, exc)
+
+    def _verify_shared_after_error(
+        self,
+        root: Path,
+        memory_id: str,
+        desired: Mapping[str, Any],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        try:
+            shared_store = self._open_record_store(root, create=False)
+            current = shared_store.get(self._RECORD_NAMESPACE, memory_id, default=None)
+            if not isinstance(current, Mapping):
+                return False, None
+            normalized = self._normalize_record(current, fallback_id=memory_id)
+            return self._record_equal(normalized, desired), normalized
+        except Exception:
+            return False, None
+
+    def _mark_unavailable(self, operation_id: str, generation: int, error: object) -> None:
+        with self._lock:
+            if generation != self._generation:
+                return
+            operation = self._pending.get(operation_id)
+            if operation is None:
+                return
+            self._shared_status = "unavailable"
+            self._shared_error = self._bounded_error(error)
+            self._last_refresh_at = time.time()
+            self._receipts[operation_id] = self._receipt_for_operation(
+                operation,
+                status="local_queued",
+                error=error,
+            )
+
+    def _mark_conflict(
+        self,
+        operation_id: str,
+        generation: int,
+        current: Mapping[str, Any] | None,
+        *,
+        error: object = None,
+    ) -> None:
+        with self._lock:
+            if generation != self._generation:
+                return
+            operation = self._pending.get(operation_id)
+            if operation is None:
+                return
+            operation = dict(operation)
+            operation["status"] = "conflict"
+            if current is not None:
+                operation["conflict_record"] = dict(current)
+            operation["error"] = self._bounded_error(error) if error else "shared revision changed"
+            self._pending[operation_id] = operation
+            self._shared_status = "ready" if self._shared_ready else self._shared_status
+            self._shared_error = None if self._shared_ready else self._shared_error
+            self._receipts[operation_id] = self._receipt_for_operation(
+                operation,
+                status="conflict",
+                error=operation["error"],
+                observed=current,
+            )
+        with self._storage_lock:
+            local_store = self._local_store
+            if local_store is not None:
+                try:
+                    local_store.put(self._PENDING_NAMESPACE, operation_id, operation)
+                except Exception:
+                    log.debug("could not persist project-memory conflict %s", operation_id, exc_info=True)
+        snapshot = None
+        with self._lock:
+            if current is not None:
+                self._shared_snapshot[str(operation["memory_id"])] = dict(current)
+                snapshot = {key: dict(value) for key, value in self._shared_snapshot.items()}
+        if snapshot is not None:
+            try:
+                self._persist_snapshot(snapshot)
+            except Exception:
+                log.debug("could not persist conflict last-good snapshot", exc_info=True)
+
+    def _remove_overlay_if_operation(self, local_store, memory_id: str, operation_id: str) -> None:
+        def mutate(current):
+            if current is None:
+                return None
+            candidate = current.get("record") if isinstance(current, Mapping) else current
+            if not isinstance(candidate, Mapping):
+                raise ValueError("Invalid project-memory overlay")
+            current_id = str(candidate.get("operation_id") or candidate.get("op_id") or "")
+            if not current_id:
+                raise ValueError("Project-memory overlay has no operation identity")
+            return None if current_id == operation_id else current
+
+        local_store.update(self._OVERLAY_NAMESPACE, memory_id, mutate)
+
+    def _finish_published(
+        self, operation_id: str, generation: int, *, cleanup_error: object = None,
+    ) -> None:
+        with self._lock:
+            if generation != self._generation:
+                return
+            operation = self._pending.get(operation_id)
+            if operation is None:
+                return
+            operation = {**operation, "status": "published"}
+            self._pending[operation_id] = operation
+            memory_id = str(operation["memory_id"])
+            desired = dict(operation["record"])
+            snapshot = {key: dict(value) for key, value in self._shared_snapshot.items()}
+            current = snapshot.get(memory_id)
+            if current is None or int(current["revision"]) < int(desired["revision"]):
+                snapshot[memory_id] = desired
+
+        overlay_cleared = pending_removed = False
+        error = cleanup_error
+        try:
+            with self._storage_lock:
+                local_store = self._local_store
+                if local_store is None:
+                    raise RuntimeError("project memory local storage is unavailable")
+                # Keep acknowledgment durable until cleanup succeeds, even across
+                # restart or another writer advancing the shared record.
+                local_store.put(self._PENDING_NAMESPACE, operation_id, operation)
+                self._persist_snapshot(snapshot)
+                self._remove_overlay_if_operation(local_store, memory_id, operation_id)
+                overlay_cleared = True
+                local_store.delete(self._PENDING_NAMESPACE, operation_id)
+                pending_removed = True
+        except Exception as exc:
+            error = error or exc
+            log.debug("Project-memory publication cleanup deferred", exc_info=True)
+
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._shared_snapshot = snapshot
+            self._shared_ready = True
+            self._shared_status = "ready" if any(not record.get("deleted") for record in snapshot.values()) else "empty"
+            self._shared_error = self._bounded_error(error) if error else None
+            if pending_removed:
+                self._pending.pop(operation_id, None)
+            current_overlay = self._overlay.get(memory_id)
+            if overlay_cleared and current_overlay is not None and current_overlay.get("operation_id") == operation_id:
+                self._overlay.pop(memory_id, None)
+                if self._latest_operation.get(memory_id) == operation_id:
+                    self._latest_operation.pop(memory_id, None)
+            self._receipts[operation_id] = self._receipt_for_operation(
+                operation, status="shared", error=error, shared_saved=True,
+            )
+            self._retry_at = 0.0 if pending_removed else time.monotonic() + self._DEFAULT_LOCAL_RETRY_SECONDS
+
+    def invalidate_buffer(self, state) -> None:
+        manager = getattr(state, "buffer_manager", None)
+        cache = getattr(manager, "_special_cache", None)
+        if isinstance(cache, dict):
+            cache.pop("project_memory", None)
 
 
 class ProjectMemoryBuffer:
     """Register the live readonly ``project_memory`` special buffer."""
 
     reads = {"buffer_manager"}
-    optional_reads = {"run_db", "agent_db"}
+    optional_reads = {"_agent_zoo_context"}
     writes = {"buffer_manager"}
 
     def __init__(self, store: ProjectMemoryStore) -> None:
@@ -827,9 +1578,6 @@ class ProjectMemoryBuffer:
 
     def __call__(self, state):
         manager = state.buffer_manager
-
-        # Keep the dynamically loaded plugin instance out of the manager's
-        # provider table. Pipeline initialization recreates this runtime binding.
         setattr(state, "_project_memory_render", functools.partial(self.render, state))
         _register_exact_special_buffer(
             manager,
@@ -839,17 +1587,33 @@ class ProjectMemoryBuffer:
         return state
 
     def render(self, state) -> ReadonlyBufferView:
-        db_error = None
-        try:
-            memories = self.store.list_all(state)
-        except Exception as exc:
-            memories = []
-            db_error = f"Project database unavailable: {type(exc).__name__}: {exc}"
-
-        common_memories = self.store.list_common()
+        memories = self.store.list_all(state)
+        status = self.store.snapshot_status()
         lines = ["# Project memories", "", f"Count: {len(memories)}"]
-        if db_error:
-            lines.extend(["", db_error])
+        storage_status = str(status.get("status") or "not_ready")
+        if storage_status == "unavailable":
+            detail = status.get("error") or "shared storage is unavailable"
+            lines.extend(["", f"Shared storage: unavailable ({detail})."])
+            if status.get("last_good"):
+                lines.append("Last-good shared snapshot retained; local queued edits remain visible.")
+            else:
+                lines.append("No shared snapshot is available; empty results are not authoritative.")
+        elif storage_status == "not_ready":
+            lines.extend(
+                [
+                    "",
+                    "Shared storage: loading in background; no shared snapshot is ready yet.",
+                    "Local queued edits remain visible.",
+                ]
+            )
+        else:
+            lines.extend(["", f"Shared storage: {storage_status}."])
+        pending = int(status.get("pending_operations", 0) or 0)
+        conflicts = list(status.get("conflicts") or ())
+        if pending:
+            lines.append(f"Local queued operations: {pending}")
+        if conflicts:
+            lines.append("Unresolved conflicts: " + ", ".join(conflicts))
         for memory in memories:
             lines.extend(
                 [
@@ -862,6 +1626,7 @@ class ProjectMemoryBuffer:
                 ]
             )
 
+        common_memories = self.store.list_common()
         if common_memories:
             lines.extend(
                 [
@@ -884,51 +1649,157 @@ class ProjectMemoryBuffer:
                         str(memory["content"]),
                     ]
                 )
-        text = "\n".join(lines).rstrip() + "\n"
         return ReadonlyBufferView(
             id="project_memory",
             path="memory://project",
-            text=text,
+            text="\n".join(lines).rstrip() + "\n",
         )
 
 
 class ProjectSessionBuffers:
-    """Expose previous project sessions as compact readonly buffers."""
+    """Project-scoped immutable aliases, bounded text, and canonical pending reads."""
 
     reads = {"buffer_manager"}
-    optional_reads = {"_agent_zoo_context", "_session_id", "run_db", "agent_db"}
+    optional_reads = {"_agent_zoo_context", "_session_id", "_local_state_root", "run_db", "agent_db"}
     writes = {"buffer_manager"}
 
     def __init__(self, *, clock=time.time) -> None:
         self.clock = clock
-        self._project_name = ""
-        self._session_id = ""
+        self._project_name = self._session_id = ""
+        self._lock = threading.RLock()
+        self._work = queue.Queue(maxsize=SESSION_LOAD_QUEUE_LIMIT)
+        self._worker: threading.Thread | None = None
+        self._inventories: dict[str, dict[str, Any]] = {}
+        self._pins: dict[tuple[str, str], dict[str, Any]] = {}
+        self._requests: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._texts: OrderedDict[tuple[str, str], tuple[str, int]] = OrderedDict()
+        self._text_bytes = 0
 
-    def bind_session(
-        self,
-        session_id: str,
-        *,
-        project_name: str | None = None,
-        db: Any | None = None,
-    ) -> None:
-        del db
+    def bind_session(self, session_id: str, *, project_name: str | None = None,
+                     db: Any | None = None) -> None:
         self._session_id = str(session_id or "")
         if project_name is not None:
             self._project_name = str(project_name or "default")
 
+    @staticmethod
+    def _project_key(project_name: str, project_dir: Path) -> str:
+        return f"{project_name}\x00{os.path.abspath(os.fspath(project_dir))}"
+
+    def _issue_aliases(self, key: str, sessions) -> dict[str, str]:
+        # Index-issued aliases survive removal and prefix collisions, even before
+        # their first document read. There is only one metadata record per alias.
+        with self._lock:
+            known = {pin["session"]["session_id"]: alias
+                     for (project, alias), pin in self._pins.items() if project == key}
+            result = _session_buffer_ids(sessions)
+            for session in sessions:
+                sid = session["session_id"]
+                if sid not in result:
+                    continue
+                alias = known.get(sid, result[sid])
+                full = SESSION_BUFFER_PREFIX + _session_key(sid)
+                while (key, alias) in self._pins and self._pins[key, alias]["session"]["session_id"] != sid:
+                    if len(alias) >= len(full):
+                        alias = ""  # Indistinguishable normalized identities cannot share an alias.
+                        break
+                    alias = full[:len(alias) + 1]
+                if not alias:
+                    result.pop(sid)
+                    continue
+                result[sid] = alias
+                self._pins.setdefault((key, alias), {"session": dict(session), "commit_id": None})
+            return result
+
+    @staticmethod
+    def _new_inventory() -> dict[str, Any]:
+        return dict(status="pending", sessions=[], error="", pending=False,
+                    has_snapshot=False, retry_at=0.0)
+
+    def _inventory_snapshot(self, key: str) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._inventories[key])
+
+    def _request_inventory(self, project_name: str, project_dir: Path,
+                           current_session_id: str) -> str:
+        key = self._project_key(project_name, project_dir)
+        with self._lock:
+            record = self._inventories.setdefault(key, self._new_inventory())
+            if record["pending"] or self.clock() < record["retry_at"]:
+                return key
+            record["pending"] = True
+            try:
+                self._work.put_nowait((key, project_name, project_dir, current_session_id))
+            except queue.Full:
+                record.update(pending=False, status="unavailable", error="catalog queue is full",
+                              retry_at=self.clock() + SESSION_INDEX_REFRESH_S)
+            if self._worker is None:
+                self._worker = threading.Thread(target=self._worker_loop,
+                                                name="azo-project-session-catalog", daemon=True)
+                self._worker.start()
+        return key
+
+    def _worker_loop(self) -> None:
+        while True:
+            try:
+                payload = self._work.get(timeout=SESSION_WORKER_IDLE_S)
+            except queue.Empty:
+                # Enqueue and idle exit share the lock; no lost wakeup on restart.
+                with self._lock:
+                    if self._work.empty():
+                        self._worker = None
+                        return
+                continue
+            try:
+                self._read_inventory(*payload)
+            finally:
+                self._work.task_done()
+
+    @staticmethod
+    def _read_catalog_snapshot(project_name: str, project_dir: Path):
+        from agent_zoo import projects
+
+        catalog_path = Path(
+            os.path.abspath(os.fspath(Path(project_dir) / "sessions" / "index.json"))
+        )
+        data = projects._read_observational_json(catalog_path)
+        if data is projects._MISSING_DOCUMENT:
+            return projects.SessionIndexSnapshot(project_name, catalog_path, [], "absent")
+        return projects.SessionIndexSnapshot(
+            project_name,
+            catalog_path,
+            projects._validate_session_index(data, catalog_path),
+            "present",
+        )
+
+    def _read_inventory(self, key, project_name, project_dir, current_session_id) -> None:
+        try:
+            snapshot = self._read_catalog_snapshot(project_name, project_dir)
+            update = dict(sessions=_eligible_project_sessions(snapshot.entries, current_session_id),
+                          has_snapshot=True, status="absent" if snapshot.absent else "ready", error="")
+        except Exception as exc:
+            update = dict(status="unavailable", error=_bounded_history_error(exc))
+        with self._lock:
+            self._inventories[key].update(update, pending=False,
+                                          retry_at=self.clock() + SESSION_INDEX_REFRESH_S)
+
+    def _local_state_root(self, state: Any, context: Mapping[str, Any]) -> str | None:
+        value = (
+            context.get("local_state_root")
+            or getattr(state, "_local_state_root", "")
+            or getattr(state, "local_state_root", "")
+        )
+        text = str(value or "").strip()
+        return text or None
+
     def __call__(self, state):
-        if not _session_namespaces_supported():
-            log.warning(
-                "Project session buffers are unavailable because this Agent Utils "
-                "build lacks special-buffer namespace support"
-            )
-            return state
         manager = state.buffer_manager
         context = dict(getattr(state, "_agent_zoo_context", {}) or {})
-        if not self._project_name:
-            self._project_name = str(context.get("project_name") or "")
-        if not self._session_id:
-            self._session_id = str(getattr(state, "_session_id", "") or "")
+        context_project_name = str(context.get("project_name") or "").strip()
+        if context_project_name:
+            self._project_name = context_project_name
+        context_session_id = str(getattr(state, "_session_id", "") or context.get("session_id") or "").strip()
+        if context_session_id:
+            self._session_id = context_session_id
 
         setattr(state, PROJECT_SESSION_INDEX_RENDER_ATTR, functools.partial(self.render_index, state))
         setattr(state, PROJECT_SESSION_RENDER_ATTR, functools.partial(self.render_session, state))
@@ -942,11 +1813,14 @@ class ProjectSessionBuffers:
             StateBoundSpecialBufferNamespaceProvider(PROJECT_SESSION_RENDER_ATTR),
             replace=True,
         )
+        project_name, project_dir, current_session_id = self._runtime_context(state)
+        if project_dir is not None:
+            self._request_inventory(project_name, project_dir, current_session_id)
         return state
 
-    def _runtime_context(self, state) -> tuple[str, Path, str]:
+    def _runtime_context(self, state) -> tuple[str, Path | None, str]:
         context = dict(getattr(state, "_agent_zoo_context", {}) or {})
-        project_name = self._project_name or str(context.get("project_name") or "default")
+        project_name = str(context.get("project_name") or self._project_name or "default")
         current_session_id = str(
             getattr(state, "_session_id", "")
             or self._session_id
@@ -961,24 +1835,53 @@ class ProjectSessionBuffers:
             if index_raw:
                 project_dir = Path(index_raw).parent.parent
             else:
-                run_db = getattr(state, "run_db", None)
-                agent_db = getattr(run_db, "agent_db", None) or getattr(state, "agent_db", None)
-                db_path = str(getattr(agent_db, "path", "") or "").strip()
-                if not db_path:
-                    raise RuntimeError("Agent Zoo project directory is unavailable")
-                project_dir = Path(db_path).parent
+                return project_name, None, current_session_id
         return project_name, project_dir, current_session_id
+
+    @staticmethod
+    def _inventory_status_lines(record: Mapping[str, Any]) -> list[str]:
+        status = str(record.get("status") or "pending")
+        sessions = list(record.get("sessions", []) or [])
+        if record.get("pending"):
+            status = "pending"
+        if status == "pending":
+            if sessions:
+                return ["Inventory: refresh pending; showing the last good metadata snapshot."]
+            return ["Inventory: pending; initial metadata read is still in progress."]
+        if status == "unavailable":
+            detail = _bounded_history_error(record.get("error"))
+            if sessions:
+                return [
+                    f"Inventory: unavailable ({detail}); showing the last good metadata snapshot."
+                ]
+            return [f"Inventory: unavailable ({detail})."]
+        if status == "absent":
+            return ["Inventory: absent; no published session catalog is available."]
+        return ["Inventory: ready."]
 
     def render_index(self, state) -> ReadonlyBufferView:
         project_name, project_dir, current_session_id = self._runtime_context(state)
-        sessions = _eligible_project_sessions(project_dir, current_session_id)
-        buffer_ids = _session_buffer_ids(sessions)
+        if project_dir is None:
+            return ReadonlyBufferView(
+                id=PROJECT_SESSIONS_BUFFER_ID,
+                path="project-memory://sessions/pending",
+                text=(
+                    "Project Sessions\n"
+                    f"Project: {project_name}\n"
+                    "Inventory: pending; Agent Zoo project context is not attached yet.\n"
+                ),
+            )
+        key = self._request_inventory(project_name, project_dir, current_session_id)
+        record = self._inventory_snapshot(key)
+        sessions = record["sessions"]
+        buffer_ids = self._issue_aliases(key, sessions)
         lines = [
             "Project Sessions",
             f"Project: {project_name}",
             f"Buffer Generated (UTC): {_format_utc(self.clock())}",
             "Order: Updated (UTC), newest first",
             "Current session omitted; RLM sessions excluded.",
+            *self._inventory_status_lines(record),
             f"Sessions: {len(buffer_ids)}",
         ]
         listed = 0
@@ -1008,43 +1911,170 @@ class ProjectSessionBuffers:
             text="\n".join(lines).rstrip() + "\n",
         )
 
+    @staticmethod
+    def _status_view(buffer_id: str, status: str, detail: str) -> ReadonlyBufferView:
+        label = "pending" if status == "pending" else "unavailable"
+        return ReadonlyBufferView(
+            id=buffer_id,
+            path=f"project-memory://sessions/{buffer_id}/{label}",
+            text=(
+                f"Session buffer {buffer_id}:\n"
+                f"{detail}\n"
+            ),
+        )
+
+    @staticmethod
+    def _ready_view(alias, pin, text) -> ReadonlyBufferView:
+        return ReadonlyBufferView(id=alias,
+            path=f"project-memory://sessions/{pin['session']['session_id']}/commits/{pin['commit_id']}",
+            text=text)
+
+    def _observe(self, scope, pin, request, timeout_s, *, project=True) -> ReadonlyBufferView | None:
+        from agent_zoo.session_load import PendingSessionLoad, load_session
+
+        # One observer projects a given request. Neither I/O observation nor CPU
+        # projection holds the global lock or delays another session/catalog.
+        if not request["lock"].acquire(blocking=False):
+            return None
+        try:
+            with self._lock:
+                if self._requests.get(scope) is not request:
+                    return None
+                if request["error"] and self.clock() < request["retry_at"]:
+                    return self._status_view(scope[1], "unavailable", request["error"])
+                request["error"] = ""  # An active retry is not evictable failure state.
+            loaded = request["handle"]
+            if loaded is None:
+                loaded = load_session(request["locator"], session_id=pin["session"]["session_id"],
+                                      commit_id=pin["commit_id"], local_state_root=request["local_root"],
+                                      timeout_s=0.0)
+                request["handle"] = loaded
+            if isinstance(loaded, PendingSessionLoad):
+                loaded = loaded.wait(timeout_s=timeout_s)
+                if isinstance(loaded, PendingSessionLoad):
+                    return None
+            saved = loaded.state
+            if not saved.commit_id or not isinstance(saved.document, Mapping):
+                raise ValueError("session loader returned no canonical committed document")
+            if saved.session_id != pin["session"]["session_id"]:
+                raise ValueError("session loader returned a different session")
+            if pin["commit_id"] is not None and saved.commit_id != pin["commit_id"]:
+                raise ValueError("session loader did not return the pinned commit")
+            if pin["commit_id"] is None:
+                source = _one_line_text(loaded.source, "unknown")
+                receipt = [f"Session source: {source}.", f"Source Repository: {saved.repository}",
+                           f"Source Commit Created (UTC): {_format_utc(saved.created_at)}",
+                           "Pinned projection: first observation retained until backend restart; "
+                           "restart releases the pin, not local saved history. "
+                           "No cross-host latest-state guarantee."]
+                if saved.journal_path is not None:
+                    receipt.append(f"Source Journal: {saved.journal_path}")
+                if source == "local":
+                    receipt.append("Session note: local-first source alone does not establish shared freshness.")
+                receipt.append(f"Freshness: {loaded.freshness}")
+                if loaded.warning:
+                    receipt.append(f"Session note: {_bounded_history_error(loaded.warning)}")
+                pin.update(commit_id=saved.commit_id, instance_id=saved.instance_id,
+                           source_format=saved.source_format, generated_at=self.clock(),
+                           receipt="\n".join(receipt))
+            if not project:
+                with self._lock:
+                    del self._requests[scope]
+                return None
+            text = pin["receipt"] + "\n\n" + _build_compact_transcript(
+                pin["session"], saved.document, commit_id=pin["commit_id"],
+                instance_id=pin["instance_id"], source_format=pin["source_format"],
+                generated_at=pin["generated_at"])
+            size = len(text.encode("utf-8"))
+            with self._lock:
+                if size <= SESSION_PROJECTION_CACHE_BYTES:
+                    while self._texts and self._text_bytes + size > SESSION_PROJECTION_CACHE_BYTES:
+                        _, (_, removed) = self._texts.popitem(last=False)
+                        self._text_bytes -= removed
+                    self._texts[scope] = (text, size)
+                    self._text_bytes += size
+                del self._requests[scope]
+            return self._ready_view(scope[1], pin, text)
+        except Exception as exc:
+            with self._lock:
+                request.update(handle=None, error=_bounded_history_error(exc),
+                               retry_at=self.clock() + SESSION_LOAD_RETRY_S)
+            return self._status_view(scope[1], "unavailable", request["error"])
+        finally:
+            request["lock"].release()
+
     def render_session(self, state, buffer_id: str) -> ReadonlyBufferView | None:
         requested = str(buffer_id or "").strip().lower()
         if not re.fullmatch(r"ses_[0-9a-z]{8,}", requested):
             return None
-        _, project_dir, current_session_id = self._runtime_context(state)
-        sessions = _eligible_project_sessions(project_dir, current_session_id)
-        buffer_ids = _session_buffer_ids(sessions)
-        session = next(
-            (
-                item
-                for item in sessions
-                if buffer_ids.get(str(item["session_id"])) == requested
-            ),
-            None,
-        )
-        if session is None:
-            return None
-        session_id = str(session["session_id"])
-        source = Path(str(session["source_transcript"]))
-        text = _cached_compact_transcript(
-            project_dir,
-            session,
-            source,
-            generated_at=self.clock(),
-        )
-        return ReadonlyBufferView(
-            id=requested,
-            path=f"project-memory://sessions/{session_id}",
-            text=text,
-        )
+        project_name, project_dir, current_session_id = self._runtime_context(state)
+        if project_dir is None:
+            return self._status_view(requested, "pending", "Agent Zoo project context is not attached yet.")
+        key = self._project_key(project_name, project_dir)
+        scope = key, requested
+        # Resolve issued identities before consulting mutable catalog metadata.
+        with self._lock:
+            pin = self._pins.get(scope)
+            cached = self._texts.get(scope)
+            if cached is not None:
+                self._texts.move_to_end(scope)
+                return self._ready_view(requested, pin, cached[0])
+        if pin is None:
+            self._request_inventory(project_name, project_dir, current_session_id)
+            record = self._inventory_snapshot(key)
+            self._issue_aliases(key, record["sessions"])
+            with self._lock:
+                pin = self._pins.get(scope)
+            if pin is None:
+                if record["pending"] or record["status"] == "unavailable":
+                    return self._status_view(requested, "pending" if record["pending"] else "unavailable",
+                                             "Metadata inventory: " + (record["error"] or "read in progress; retry shortly."))
+                return None
+
+        # Reclaim completed handles without projecting unrelated documents.
+        # Preserve their exact identity/receipt; skip any still-running observer.
+        with self._lock:
+            completed = [(other, self._pins[other], req) for other, req in self._requests.items()
+                         if len(self._requests) >= SESSION_LOAD_QUEUE_LIMIT and other != scope
+                         and getattr(req["handle"], "done", False)]
+        for other, other_pin, req in completed:
+            self._observe(other, other_pin, req, 0.0, project=False)
+            with self._lock:
+                if len(self._requests) < SESSION_LOAD_QUEUE_LIMIT:
+                    break
+        with self._lock:
+            cached = self._texts.get(scope)
+            if cached is not None:
+                self._texts.move_to_end(scope)
+                return self._ready_view(requested, pin, cached[0])
+            request = self._requests.get(scope)
+            if request is None:
+                for other in list(self._requests):
+                    if len(self._requests) < SESSION_LOAD_QUEUE_LIMIT:
+                        break
+                    if self._requests[other]["error"]:
+                        del self._requests[other]
+                if len(self._requests) >= SESSION_LOAD_QUEUE_LIMIT:
+                    return self._status_view(requested, "unavailable", "History request capacity is busy; retry shortly.")
+                request = dict(lock=threading.Lock(), handle=None, error="", retry_at=0.0,
+                               locator=_session_source(project_dir, pin["session"]["session_id"]),
+                               local_root=self._local_state_root(state, getattr(state, "_agent_zoo_context", {}) or {}))
+                self._requests[scope] = request
+        view = self._observe(scope, pin, request, SESSION_OBSERVE_S)
+        if view is not None:
+            return view
+        session = pin["session"]
+        return self._status_view(requested, "pending",
+            f"Title: {_one_line_text(session.get('title'), '(untitled)')}\n"
+            f"Description: {_one_line_text(session.get('description'), '(none)')}\n"
+            "Transcript load requested. Please try again shortly.")
 
 
 class ProjectMemoryTool(Tool):
     """Shared dispatch behavior for project-memory tools."""
 
     group = "Project Memory"
-    optional_reads = {"run_db", "agent_db"}
+    optional_reads = {"_agent_zoo_context"}
 
     def __init__(self, store: ProjectMemoryStore) -> None:
         super().__init__()
@@ -1063,20 +2093,21 @@ class ProjectMemoryTool(Tool):
     def execute(self, state, **kwargs):
         raise NotImplementedError
 
-    @staticmethod
-    def _format(memory: Mapping[str, Any], verb: str) -> str:
-        return (
+    def _format(self, memory: Mapping[str, Any], verb: str) -> str:
+        result = (
             f"{verb} {memory['id']}.\n"
             f"Trigger: {memory['trigger']}\n"
             f"Content: {memory['content']}"
         )
+        receipt = self.store.receipt_text(str(memory["id"]))
+        return result + (f"\n{receipt}" if receipt else "")
 
 
 class RecordMemory(ProjectMemoryTool):
     """Save a project-scoped memory with a regular-expression trigger."""
 
     reads = {"entries", "step"}
-    optional_reads = {"run_db", "agent_db", "context_compaction"}
+    optional_reads = {"_agent_zoo_context", "context_compaction"}
 
     def __init__(self, store: ProjectMemoryStore, recall: "ProjectMemoryRecall") -> None:
         super().__init__(store)
@@ -1105,6 +2136,11 @@ class RecordMemory(ProjectMemoryTool):
         )
         result = self._format(memory, "Recorded")
         if not matches:
+            if truncated:
+                return result + (
+                    "\nBacktest: incomplete; the active context scan was truncated before "
+                    "an exhaustive no-match conclusion."
+                )
             return result + "\nBacktest: no messages or tool calls matched in the active context window."
 
         count = len(matches)
@@ -1130,7 +2166,7 @@ class RecordMemory(ProjectMemoryTool):
 class UpdateMemory(ProjectMemoryTool):
     """Refine an existing project memory."""
 
-    optional_reads = {"run_db", "agent_db", PENDING_RECALLS_ATTR}
+    optional_reads = {"_agent_zoo_context", PENDING_RECALLS_ATTR}
     writes = {PENDING_RECALLS_ATTR, "tool_schemas"}
     init = {PENDING_RECALLS_ATTR: list, "tool_schemas": dict}
 
@@ -1166,7 +2202,7 @@ class UpdateMemory(ProjectMemoryTool):
 class SuppressMemory(ProjectMemoryTool):
     """Temporarily suppress a memory in the current session."""
 
-    optional_reads = {"run_db", "agent_db", PENDING_RECALLS_ATTR}
+    optional_reads = {"_agent_zoo_context", PENDING_RECALLS_ATTR}
     writes = {SUPPRESSIONS_ATTR, PENDING_RECALLS_ATTR, "tool_schemas"}
     init = {
         SUPPRESSIONS_ATTR: dict,
@@ -1207,7 +2243,7 @@ class SuppressMemory(ProjectMemoryTool):
 class DeleteMemory(ProjectMemoryTool):
     """Delete an obsolete project memory."""
 
-    optional_reads = {"run_db", "agent_db", SUPPRESSIONS_ATTR, PENDING_RECALLS_ATTR}
+    optional_reads = {"_agent_zoo_context", SUPPRESSIONS_ATTR, PENDING_RECALLS_ATTR}
     writes = {SUPPRESSIONS_ATTR, PENDING_RECALLS_ATTR, "tool_schemas"}
     init = {
         SUPPRESSIONS_ATTR: dict,
@@ -1230,7 +2266,9 @@ class DeleteMemory(ProjectMemoryTool):
         getattr(state, SUPPRESSIONS_ATTR).pop(memory_id, None)
         pending = getattr(state, PENDING_RECALLS_ATTR)
         pending[:] = [item for item in pending if item.get("id") != memory_id]
-        return f"Deleted {memory_id}."
+        receipt = self.store.receipt_text(memory_id)
+        result = f"Deleted {memory_id}."
+        return result + (f"\n{receipt}" if receipt else "")
 
 
 class ProjectMemoryRecall:
@@ -1249,6 +2287,7 @@ class ProjectMemoryRecall:
         SUPPRESSIONS_ATTR,
         BOOTSTRAPPED_ATTR,
         LAST_ENTRY_COUNT_ATTR,
+        DEFERRED_EVENTS_ATTR,
     }
     init = {
         SEEN_EVENTS_ATTR: list,
@@ -1256,6 +2295,7 @@ class ProjectMemoryRecall:
         SUPPRESSIONS_ATTR: dict,
         BOOTSTRAPPED_ATTR: bool,
         LAST_ENTRY_COUNT_ATTR: int,
+        DEFERRED_EVENTS_ATTR: list,
     }
 
     def __init__(self, store: ProjectMemoryStore) -> None:
@@ -1272,13 +2312,18 @@ class ProjectMemoryRecall:
             self._new_events(state, entries, baseline_only=True)
             return state
         events = self._new_events(state, entries)
-        if not events:
-            return state
+        deferred = getattr(state, DEFERRED_EVENTS_ATTR, [])
+        events = list(dict((str(key), str(text)[:MAX_MATCH_TEXT])
+                           for key, text in [*deferred, *events]).items())[-32:]
         try:
             memories = self.store.list_all(state)
+            snapshot_ready = self.store.snapshot_status()["ready"]
         except Exception:
-            log.debug("project memory database unavailable during recall", exc_info=True)
-            memories = []
+            log.debug("project memory snapshot unavailable during recall", exc_info=True)
+            memories, snapshot_ready = [], False
+        setattr(state, DEFERRED_EVENTS_ATTR, [] if snapshot_ready else events)
+        if not events:
+            return state
         memories.extend(self.store.list_common(enabled_only=True))
         if not memories:
             return state
@@ -1298,7 +2343,10 @@ class ProjectMemoryRecall:
         queued_ids = {str(item.get("id") or "") for item in pending if isinstance(item, Mapping)}
         event_texts = [text for _event_id, text in events if text]
 
+        deadline = time.monotonic() + RECALL_SECONDS
         for memory in memories:
+            if time.monotonic() >= deadline or len(pending) >= MAX_RECALLS:
+                break
             memory_id = memory["id"]
             if memory_id in queued_ids or memory_id in suppressions:
                 continue
@@ -1306,11 +2354,11 @@ class ProjectMemoryRecall:
             if not content or self._content_is_active(content, active_text):
                 continue
             try:
-                trigger = re.compile(str(memory.get("trigger") or ""))
-            except re.error:
+                trigger = _compile_trigger(str(memory.get("trigger") or ""))
+            except regex.error:
                 log.warning("Skipping project memory %s with invalid stored regex", memory_id)
                 continue
-            if not any(trigger.search(text) for text in event_texts):
+            if not any(_trigger_matches(trigger, text, deadline) for text in event_texts):
                 continue
             pending.append({"id": memory_id, "content": content})
             queued_ids.add(memory_id)
@@ -1330,7 +2378,15 @@ class ProjectMemoryRecall:
         bootstrapped = bool(getattr(state, BOOTSTRAPPED_ATTR, False))
         current_step = self._int_value(getattr(state, "step", 0), 0)
 
-        for position, entry in enumerate(entries):
+        previous_count = self._int_value(getattr(state, LAST_ENTRY_COUNT_ATTR, 0), 0)
+        # Revisit the mutable tail for tool completion, not the entire saved history.
+        # A truncation/replacement is a new baseline, not thousands of new events.
+        reset = len(entries) < previous_count
+        start = max(0, previous_count - 2) if bootstrapped and not reset else 0
+        if reset:
+            bootstrapped = False
+        for position in range(start, len(entries)):
+            entry = entries[position]
             entry_step = self._int_value(self._get(entry, "step", -1), -1)
             for event_id, text in self._entry_events(entry, position):
                 current_ids.append(event_id)
@@ -1411,7 +2467,7 @@ class ProjectMemoryRecall:
         exclusion is used to avoid matching the active ``record_memory`` call
         against its own trigger argument.
         """
-        pattern = re.compile(str(trigger))
+        pattern = _compile_trigger(str(trigger))
         entries = list(getattr(state, "entries", []) or [])
         start, handoff_text = self._active_context_window(state, entries)
         excluded = {str(event_id) for event_id in exclude_event_ids}
@@ -1430,8 +2486,20 @@ class ProjectMemoryRecall:
 
         matches: list[dict[str, str]] = []
         truncated = False
+        deadline = time.monotonic() + RECALL_SECONDS
         for label, text in reversed(candidates):
-            if not pattern.search(text):
+            remaining = min(REGEX_SECONDS, deadline - time.monotonic())
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(text) > MAX_MATCH_TEXT:
+                truncated = True
+            try:
+                matched = pattern.search(text[:MAX_MATCH_TEXT], timeout=remaining)
+            except TimeoutError:
+                truncated = True
+                continue
+            if not matched:
                 continue
             if len(matches) >= MAX_BACKTEST_MATCHES:
                 truncated = True
@@ -1779,60 +2847,75 @@ class ProjectMemorySystemPrompt(RenderTransformRegistrar):
         return base / "agent-zoo"
 
 
+def _subfeature_enabled(section: Mapping[str, Any], name: str) -> bool:
+    value = section.get(name, True)
+    if isinstance(value, Mapping):
+        value = value.get("enabled", True)
+    return _config_enabled(value)
+
+
 def register_features(builder, *, session, config):
-    """Register the project_memory feature in every Agent Zoo pipeline."""
+    """Register enabled project-memory sub-features in every Agent Zoo pipeline."""
     del session
     section = ProjectMemorySystemPrompt.effective_section(config)
     if not ProjectMemorySystemPrompt.enabled(section.get("enabled", True)):
         return
 
-    session_config = section.get("project_sessions", True)
-    if isinstance(session_config, Mapping):
-        sessions_requested = ProjectMemorySystemPrompt.enabled(
-            session_config.get("enabled", True)
+    regex_memories_enabled = _subfeature_enabled(section, "regex_memories")
+    sessions_enabled = _subfeature_enabled(section, "project_sessions")
+    if not regex_memories_enabled and not sessions_enabled:
+        return
+
+    default_prompt = " ".join(text for enabled, text in (
+        (regex_memories_enabled, CORE_SYSTEM_PROMPT), (sessions_enabled, SESSION_SYSTEM_PROMPT),
+    ) if enabled)
+    prompt = str(section.get("system_prompt", default_prompt) or "").strip()
+
+    components = []
+    order = [TurnCounter, RegisterSpecialBuffers]
+
+    if regex_memories_enabled:
+        store = ProjectMemoryStore(ProjectMemorySystemPrompt.common_memories(section))
+        recall = ProjectMemoryRecall(store)
+        components.extend(
+            [
+                store,
+                ProjectMemoryBuffer(store),
+                RecordMemory(store, recall),
+                UpdateMemory(store),
+                SuppressMemory(store),
+                DeleteMemory(store),
+                recall,
+                ProjectMemoryDelivery(),
+            ]
         )
-    else:
-        sessions_requested = ProjectMemorySystemPrompt.enabled(session_config)
-    sessions_enabled = sessions_requested and _session_namespaces_supported()
-    if sessions_requested and not sessions_enabled:
-        _warn_session_namespaces_unavailable()
+        order.extend([ProjectMemoryStore, ProjectMemoryBuffer])
 
-    prompt = str(section.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
-    if not sessions_enabled:
-        prompt = prompt.replace(SESSION_SYSTEM_PROMPT, "").strip()
-
-    store = ProjectMemoryStore(ProjectMemorySystemPrompt.common_memories(section))
-    recall = ProjectMemoryRecall(store)
-    components = [
-        store,
-        ProjectMemoryBuffer(store),
-        RecordMemory(store, recall),
-        UpdateMemory(store),
-        SuppressMemory(store),
-        DeleteMemory(store),
-        recall,
-        ProjectMemoryDelivery(),
-        ProjectMemorySystemPrompt(prompt),
-    ]
-    order = [
-        TurnCounter,
-        RegisterSpecialBuffers,
-        ProjectMemoryStore,
-        ProjectMemoryBuffer,
-        ToolDispatchStart,
-        ConsolidateToolResults,
-        FailedToolCallRecorder,
-        ProjectMemoryRecall,
-        ProjectMemoryDelivery,
-        CompressToolResults,
-        SystemPromptSkillList,
-        ProjectMemorySystemPrompt,
-        ExcludeForgotten,
-        MessageRenderer,
-    ]
     if sessions_enabled:
-        components.insert(2, ProjectSessionBuffers())
-        order.insert(order.index(ToolDispatchStart), ProjectSessionBuffers)
+        components.append(ProjectSessionBuffers())
+        order.append(ProjectSessionBuffers)
+
+    order.append(ToolDispatchStart)
+    if regex_memories_enabled:
+        order.extend(
+            [
+                ConsolidateToolResults,
+                FailedToolCallRecorder,
+                ProjectMemoryRecall,
+                ProjectMemoryDelivery,
+                CompressToolResults,
+            ]
+        )
+
+    components.append(ProjectMemorySystemPrompt(prompt))
+    order.extend(
+        [
+            SystemPromptSkillList,
+            ProjectMemorySystemPrompt,
+            ExcludeForgotten,
+            MessageRenderer,
+        ]
+    )
 
     builder.add(
         Feature(

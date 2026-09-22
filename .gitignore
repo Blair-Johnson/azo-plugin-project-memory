@@ -4,3 +4,6 @@ __pycache__/
 .pytest_cache/
 pixi.lock
 .DS_Store
+.agents/
+.test-home/
+.local-spool/

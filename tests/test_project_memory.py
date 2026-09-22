@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import pickle
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +10,6 @@ from agent_utils.types import ToolCall
 from agent_zoo import pipelines
 from agent_zoo.modes import default_modes, rlm_modes
 from agent_utils.files.buffer_manager import BufferManager
-from tmux_pilot.database import AgentDB, RunDB
 
 import project_memory as pm
 
@@ -25,16 +23,17 @@ def entry(index: int, role: str, content: str, *, step: int | None = None, **mes
 
 
 @pytest.fixture
-def project_db(tmp_path):
-    db = AgentDB(tmp_path / "project.sqlite")
-    db.init()
-    yield db
-    db.close()
+def project_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_ZOO_LOCAL_STATE_ROOT", str(tmp_path / "local"))
+    project = tmp_path / "shared" / "projects" / "demo"
+    project.mkdir(parents=True)
+    return project
 
 
-def state_for(db: AgentDB, *, run_id: str = "run-1", step: int = 1) -> State:
+def state_for(db: Path, *, run_id: str = "run-1", step: int = 1) -> State:
     state = State(token_budget=10_000)
-    state.run_db = RunDB(db, run_id, session_id=run_id)
+    state._session_id = run_id
+    state._agent_zoo_context = {"project_name": "demo", "project_dir": str(db), "session_id": run_id}
     state.buffer_manager = BufferManager()
     state.step = step
     state.entries = [entry(0, "system", "system prompt", step=0)]
@@ -51,66 +50,6 @@ def add_message(state: State, role: str, content: str, **message) -> Entry:
     item = entry(len(state.entries), role, content, step=message_step, **message)
     state.entries.append(item)
     return item
-
-
-def saved_entry(
-    index: int,
-    role: str,
-    content: str,
-    *,
-    system_generated: bool = False,
-    tool_calls: list[dict] | None = None,
-) -> dict:
-    item = {
-        "messages": [{"role": role, "content": content}],
-        "index": index,
-        "step": index,
-        "tokens": 0,
-        "pinned": False,
-        "compressed": False,
-        "forgotten": False,
-        "system_generated": system_generated,
-        "mode_at_submission": None,
-        "mode_user_message_addendum": "",
-        "mode_user_message_addendum_role": "system",
-        "mode_submission_recorded": False,
-    }
-    if tool_calls:
-        item["tool_calls"] = tool_calls
-    return item
-
-
-def write_saved_session(project_dir, session_id: str, entries: list[dict]):
-    session_dir = project_dir / "sessions" / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    source = session_dir / "session.json"
-    source.write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "meta": {"session_id": session_id},
-                "entries": entries,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return source
-
-
-def project_session_state(project_dir, current_session_id: str) -> State:
-    state = State(token_budget=10_000)
-    state.step = 1
-    state.buffer_manager = BufferManager()
-    state._session_id = current_session_id
-    state._agent_zoo_context = {
-        "project_name": "demo",
-        "project_dir": str(project_dir),
-        "session_id": current_session_id,
-        "project_session_index": str(project_dir / "sessions" / "index.json"),
-    }
-    return state
 
 
 def call_tool(tool, state: State, **kwargs) -> str:
@@ -143,369 +82,6 @@ def call_tool(tool, state: State, **kwargs) -> str:
     assert tool_call.result is not None
     assert tool_call.error is False
     return str(tool_call.result)
-
-
-def test_store_crud_and_short_ids(project_db):
-    state = state_for(project_db)
-    store = pm.ProjectMemoryStore()
-
-    memory = store.create(state, "Use pixi run for tests.", r"\bpixi\b")
-    assert memory["id"].startswith("mem_")
-    assert len(memory["id"]) == 10
-    assert store.get(state, memory["id"])["content"] == "Use pixi run for tests."
-
-    updated = store.update(state, memory["id"], trigger=r"pytest|pixi")
-    assert updated["content"] == memory["content"]
-    assert updated["trigger"] == r"pytest|pixi"
-    assert store.list_all(state) == [updated]
-
-    assert store.delete(state, memory["id"]) is True
-    assert store.delete(state, memory["id"]) is False
-    assert store.list_all(state) == []
-
-
-def test_store_rejects_invalid_values(project_db):
-    state = state_for(project_db)
-    store = pm.ProjectMemoryStore()
-
-    with pytest.raises(ValueError, match="content"):
-        store.create(state, "  ", "valid")
-    with pytest.raises(ValueError, match="invalid memory trigger regex"):
-        store.create(state, "content", "[")
-
-
-def test_store_startup_and_reads_do_not_create_schema(project_db):
-    state = state_for(project_db)
-    store = pm.ProjectMemoryStore()
-
-    store(state)
-    assert store.list_all(state) == []
-    assert store.get(state, "mem_missing") is None
-    assert project_db.conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (pm.TABLE_NAME,),
-    ).fetchone() is None
-
-
-def test_project_memory_buffer_is_live_readonly_and_shared(project_db):
-    first = state_for(project_db, run_id="one")
-    second = state_for(project_db, run_id="two")
-    store = pm.ProjectMemoryStore()
-    component = pm.ProjectMemoryBuffer(store)
-    component(first)
-    component(second)
-
-    initial = first.buffer_manager.resolve_for_read(first, "project_memory")
-    assert initial.readonly is True
-    assert initial.id == "project_memory"
-    assert initial.path == "memory://project"
-    assert "Count: 0" in initial.text
-
-    memory = store.create(second, "Shared across project sessions.", r"cross[- ]session")
-    component(first)
-    refreshed = first.buffer_manager.resolve_for_read(first, "project_memory")
-    assert memory["id"] in refreshed.text
-    assert 'Trigger regex: "cross[- ]session"' in refreshed.text
-    assert "Shared across project sessions." in refreshed.text
-
-
-def test_project_memory_buffer_provider_is_pickle_safe(project_db):
-    state = state_for(project_db)
-    store = pm.ProjectMemoryStore()
-    component = pm.ProjectMemoryBuffer(store)
-    manager = state.buffer_manager
-    component(state)
-    assert state.buffer_manager is manager
-    provider = state.buffer_manager._special_buffers["project_memory"]
-    assert type(provider).__module__ == "operator"
-    assert type(provider).__name__ == "methodcaller"
-    memory = store.create(state, "Survive RLM state serialization.", r"serialization")
-
-    restored_manager = pickle.loads(pickle.dumps(state.buffer_manager))
-    state.buffer_manager = restored_manager
-    state.__dict__.pop("_project_memory_render", None)
-    component(state)
-
-    rendered = state.buffer_manager.resolve_for_read(state, "project_memory")
-    assert memory["id"] in rendered.text
-    assert "Survive RLM state serialization." in rendered.text
-
-
-
-
-def test_project_memory_buffer_supports_legacy_exact_registration_api():
-    class LegacyBufferManager:
-        def __init__(self):
-            self._special_buffers = {}
-            self._special_cache = {"project_memory": (1, object())}
-
-        def is_special(self, buffer_id):
-            return buffer_id in self._special_buffers
-
-        def register_special_buffer(self, buffer_id, provider):
-            if buffer_id in self._special_buffers:
-                raise ValueError("already registered")
-            self._special_buffers[buffer_id] = provider
-
-    state = SimpleNamespace(buffer_manager=LegacyBufferManager())
-    component = pm.ProjectMemoryBuffer(pm.ProjectMemoryStore())
-
-    component(state)
-    component(state)
-
-    provider = state.buffer_manager._special_buffers["project_memory"]
-    assert type(provider).__name__ == "methodcaller"
-    assert "project_memory" not in state.buffer_manager._special_cache
-
-
-def test_local_crud_invalidates_same_step_buffer_cache(project_db):
-    state = state_for(project_db)
-    store = pm.ProjectMemoryStore()
-    pm.ProjectMemoryBuffer(store)(state)
-    assert "Count: 0" in state.buffer_manager.resolve_for_read(state, "project_memory").text
-
-    memory = store.create(state, "Current immediately.", "immediately")
-    current = state.buffer_manager.resolve_for_read(state, "project_memory")
-    assert memory["id"] in current.text
-
-
-def test_project_session_index_and_compact_buffers_are_lazy_and_filtered(tmp_path):
-    project_dir = tmp_path / "demo"
-    sessions_dir = project_dir / "sessions"
-    sessions_dir.mkdir(parents=True)
-    current_id = "aaaaaaaa-0000-0000-0000-000000000000"
-    recent_id = "344655c1-1111-1111-1111-111111111111"
-    older_id = "97568885-2222-2222-2222-222222222222"
-    rlm_id = "bbbbbbbb-3333-3333-3333-333333333333"
-
-    write_saved_session(project_dir, current_id, [saved_entry(0, "user", "current")])
-    recent_source = write_saved_session(
-        project_dir,
-        recent_id,
-        [
-            saved_entry(0, "system", "system"),
-            saved_entry(1, "user", "Run the experiment."),
-            saved_entry(
-                2,
-                "assistant",
-                "I will inspect the files.",
-                tool_calls=[{"id": "call-1"}],
-            ),
-            saved_entry(3, "tool", "large tool output"),
-            saved_entry(4, "assistant", "The experiment finished successfully."),
-            saved_entry(5, "user", "terminal completion", system_generated=True),
-            saved_entry(6, "user", "Fine tune all checkpoints."),
-            saved_entry(7, "assistant", "I will fine tune all eight checkpoints."),
-        ],
-    )
-    write_saved_session(project_dir, older_id, [saved_entry(0, "user", "older")])
-    write_saved_session(project_dir, rlm_id, [saved_entry(0, "user", "rlm")])
-    index = [
-        {
-            "session_id": older_id,
-            "title": "older",
-            "description": "old description",
-            "kind": "default",
-            "created_at": 100.0,
-            "updated_at": 200.0,
-        },
-        {
-            "session_id": current_id,
-            "title": "current",
-            "description": "active",
-            "kind": "default",
-            "created_at": 300.0,
-            "updated_at": 900.0,
-        },
-        {
-            "session_id": rlm_id,
-            "title": "child",
-            "description": "hidden",
-            "kind": "rlm",
-            "created_at": 400.0,
-            "updated_at": 800.0,
-        },
-        {
-            "session_id": recent_id,
-            "title": "recent experiment",
-            "description": "two-line\ndescription",
-            "kind": "default",
-            "created_at": 500.0,
-            "updated_at": 700.0,
-        },
-    ]
-    (sessions_dir / "index.json").write_text(
-        json.dumps(index, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    state = project_session_state(project_dir, current_id)
-    component = pm.ProjectSessionBuffers(clock=lambda: 1_700_000_000.0)
-
-    component(state)
-    cache_root = project_dir / "plugin-data" / "project-memory" / "compact"
-    assert not cache_root.exists()
-
-    rendered_index = state.buffer_manager.resolve_for_read(state, "project_sessions")
-    assert rendered_index.readonly is True
-    assert "Project Sessions" in rendered_index.text
-    assert "Buffer Generated (UTC): 2023-11-14 22:13:20" in rendered_index.text
-    assert "Sessions: 2" in rendered_index.text
-    assert current_id not in rendered_index.text
-    assert rlm_id not in rendered_index.text
-    assert rendered_index.text.index(recent_id) < rendered_index.text.index(older_id)
-    assert "Buffer: ses_344655c1" in rendered_index.text
-    assert "Title: recent experiment | Description: two-line description" in rendered_index.text
-    assert not cache_root.exists()
-
-    compact = state.buffer_manager.resolve_for_read(state, "ses_344655c1")
-    assert compact.readonly is True
-    assert compact.path == f"project-memory://sessions/{recent_id}"
-    assert f"Session ID: {recent_id}" in compact.text
-    assert "Title: recent experiment" in compact.text
-    assert "Description: two-line description" in compact.text
-    assert "Created (UTC): 1970-01-01 00:08:20" in compact.text
-    assert "Updated (UTC): 1970-01-01 00:11:40" in compact.text
-    assert "Buffer Generated (UTC): 2023-11-14 22:13:20" in compact.text
-    assert f"Source Transcript: {recent_source.resolve()}" in compact.text
-    assert "Order: Newest turn first" in compact.text
-    newest_user = compact.text.index("USER [entry 6, lines ")
-    newest_assistant = compact.text.index("ASSISTANT [entry 7, lines ")
-    older_user = compact.text.index("USER [entry 1, lines ")
-    older_assistant = compact.text.index("ASSISTANT [entry 4, lines ")
-    assert newest_user < newest_assistant < older_user < older_assistant
-    assert "USER [entry 1, lines " in compact.text
-    assert "ASSISTANT [entry 4, lines " in compact.text
-    assert "USER [entry 6, lines " in compact.text
-    assert "ASSISTANT [entry 7, lines " in compact.text
-    assert compact.text.count("\nUSER [") == 2
-    assert compact.text.count("\nASSISTANT [") == 2
-    assert "I will inspect the files." not in compact.text
-    assert "large tool output" not in compact.text
-    assert "terminal completion" not in compact.text
-    assert "The experiment finished successfully." in compact.text
-    assert cache_root.is_dir()
-
-    with pytest.raises(KeyError, match="No buffer 'ses_bbbbbbbb'"):
-        state.buffer_manager.resolve_for_read(state, "ses_bbbbbbbb")
-    with pytest.raises(KeyError, match="No buffer 'ses_aaaaaaaa'"):
-        state.buffer_manager.resolve_for_read(state, "ses_aaaaaaaa")
-
-
-def test_compact_session_cache_reuses_and_invalidates_source(tmp_path, monkeypatch):
-    project_dir = tmp_path / "demo"
-    session_id = "344655c1-1111-1111-1111-111111111111"
-    source = write_saved_session(
-        project_dir,
-        session_id,
-        [saved_entry(0, "user", "first"), saved_entry(1, "assistant", "original")],
-    )
-    session = {
-        "session_id": session_id,
-        "title": "cache",
-        "description": "",
-        "kind": "default",
-        "created_at": 1.0,
-        "updated_at": 2.0,
-    }
-    (project_dir / "sessions" / "index.json").write_text(
-        json.dumps([session], indent=2) + "\n",
-        encoding="utf-8",
-    )
-    state = project_session_state(project_dir, "ffffffff-0000-0000-0000-000000000000")
-    component = pm.ProjectSessionBuffers(clock=lambda: 3.0)
-    component(state)
-    original = pm._build_compact_transcript
-    calls = []
-
-    def tracked(*args, **kwargs):
-        calls.append(1)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(pm, "_build_compact_transcript", tracked)
-    first = state.buffer_manager.resolve_for_read(state, "ses_344655c1")
-    second = state.buffer_manager.resolve_for_read(state, "ses_344655c1")
-    assert first.text == second.text
-    assert len(calls) == 1
-
-    with monkeypatch.context() as cache_hit_patch:
-        original_read_text = Path.read_text
-
-        def reject_source_read(path, *args, **kwargs):
-            if path == source:
-                raise AssertionError("compact cache hit reread the source transcript")
-            return original_read_text(path, *args, **kwargs)
-
-        cache_hit_patch.setattr(Path, "read_text", reject_source_read)
-        disk_cached = pm._cached_compact_transcript(
-            project_dir,
-            session,
-            source,
-            generated_at=4.0,
-        )
-
-    assert disk_cached == first.text
-
-    write_saved_session(
-        project_dir,
-        session_id,
-        [
-            saved_entry(0, "user", "first"),
-            saved_entry(1, "assistant", "changed response with more text"),
-        ],
-    )
-    assert source.exists()
-    changed = state.buffer_manager.resolve_for_read(state, "ses_344655c1")
-    assert "changed response with more text" in changed.text
-    assert len(calls) == 2
-
-
-def test_session_buffer_ids_extend_colliding_prefixes():
-    sessions = [
-        {"session_id": "12345678-a000-0000-0000-000000000000"},
-        {"session_id": "12345678-b000-0000-0000-000000000000"},
-        {"session_id": "abcdef12-c000-0000-0000-000000000000"},
-    ]
-
-    assert pm._session_buffer_ids(sessions) == {
-        "12345678-a000-0000-0000-000000000000": "ses_12345678a",
-        "12345678-b000-0000-0000-000000000000": "ses_12345678b",
-        "abcdef12-c000-0000-0000-000000000000": "ses_abcdef12",
-    }
-
-
-def test_project_session_namespace_provider_survives_manager_pickle(tmp_path):
-    project_dir = tmp_path / "demo"
-    session_id = "344655c1-1111-1111-1111-111111111111"
-    write_saved_session(project_dir, session_id, [saved_entry(0, "user", "hello")])
-    (project_dir / "sessions" / "index.json").write_text(
-        json.dumps(
-            [
-                {
-                    "session_id": session_id,
-                    "title": "pickle",
-                    "description": "",
-                    "kind": "default",
-                    "created_at": 1.0,
-                    "updated_at": 2.0,
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    state = project_session_state(project_dir, "ffffffff-0000-0000-0000-000000000000")
-    component = pm.ProjectSessionBuffers(clock=lambda: 3.0)
-    component(state)
-
-    restored = pickle.loads(pickle.dumps(state.buffer_manager))
-    state.buffer_manager = restored
-    state.__dict__.pop(pm.PROJECT_SESSION_RENDER_ATTR, None)
-    state.__dict__.pop(pm.PROJECT_SESSION_INDEX_RENDER_ATTR, None)
-    component(state)
-
-    compact = state.buffer_manager.resolve_for_read(state, "ses_344655c1")
-    assert "USER [entry 0, lines " in compact.text
-    provider = state.buffer_manager._special_buffer_namespaces["ses_"]
-    assert type(provider).__module__ == "agent_utils.files.buffer_manager"
 
 
 def test_record_memory_backtests_messages_and_tool_results(project_db):
@@ -995,43 +571,6 @@ def test_register_features_can_be_disabled(monkeypatch):
     assert builder.features == []
 
 
-
-
-def test_register_features_degrades_without_session_namespace_support(
-    monkeypatch,
-    caplog,
-):
-    monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
-    monkeypatch.setattr(pm, "_session_namespaces_supported", lambda: False)
-    monkeypatch.setattr(pm, "_SESSION_NAMESPACE_WARNING_EMITTED", False)
-
-    class Builder:
-        def __init__(self):
-            self.features = []
-
-        def add(self, feature: Feature):
-            self.features.append(feature)
-            return self
-
-    builder = Builder()
-    with caplog.at_level("WARNING"):
-        pm.register_features(builder, session=SimpleNamespace(), config={})
-
-    feature = builder.features[0]
-    types = {type(component) for component in feature.components}
-    assert pm.ProjectMemoryStore in types
-    assert pm.ProjectMemoryBuffer in types
-    assert pm.RecordMemory in types
-    assert pm.ProjectSessionBuffers not in types
-    prompt = next(
-        component
-        for component in feature.components
-        if isinstance(component, pm.ProjectMemorySystemPrompt)
-    )
-    assert "project_sessions" not in prompt.text
-    assert "Core project-memory tools remain active" in caplog.text
-
-
 def test_feature_contains_all_tools_and_special_buffer(monkeypatch):
     monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
 
@@ -1156,3 +695,20 @@ def test_pre_restore_pass_does_not_bootstrap_recall_state(project_db):
     add_message(state, "assistant", "New historic startup discussion.", step=6)
     recall(state)
     assert [item["id"] for item in state.project_memory_pending_recalls] == [memory["id"]]
+
+
+@pytest.mark.parametrize("regex_enabled,sessions_enabled", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("origin", ["installed", "launch", "empty"])
+def test_custom_prompt_respected_with_independent_features(monkeypatch, regex_enabled, sessions_enabled, origin):
+    installed = {"project_memory": {"system_prompt": "Installed guidance."}}
+    monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: installed)
+    section = {"regex_memories": regex_enabled, "project_sessions": sessions_enabled}
+    expected = {"installed": "Installed guidance.", "launch": "Launch guidance.", "empty": ""}[origin]
+    if origin != "installed":
+        section["system_prompt"] = expected
+    features = []
+    pm.register_features(SimpleNamespace(add=features.append), session=None,
+                         config={"project_memory": section})
+    prompt = next(component for component in features[0].components
+                  if isinstance(component, pm.ProjectMemorySystemPrompt))
+    assert prompt.text == expected
