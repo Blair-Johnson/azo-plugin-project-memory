@@ -125,3 +125,25 @@ def test_custom_prompt_respected_with_independent_features(
     prompt = next(component for component in features[0].components
                   if isinstance(component, pm.ProjectMemorySystemPrompt))
     assert prompt.text == expected
+
+
+def test_config_template_preserves_detailed_session_guidance(monkeypatch):
+    from pathlib import Path
+
+    template = Path(__file__).parents[1] / "config" / "project_memory.yaml"
+    monkeypatch.setenv(pm.CONFIG_PATH_ENV, str(template))
+    features = []
+    pm.register_features(SimpleNamespace(add=features.append), session=None, config={})
+    prompt = next(component.text for component in features[0].components
+                  if isinstance(component, pm.ProjectMemorySystemPrompt))
+    for guidance in (
+        "substantial contiguous sequence of turns", "do not stop at the first turn",
+        "older decision", "ses_<id>_full", "newest entries first",
+        "Source Commit", "Source Instance", "not journal file lines",
+        "live_sessions", "endpoints are not connectivity checks",
+        "config/project_memory.yaml as a template", "plugin-configs/azo-plugin-project-memory",
+        "Reinstall after source changes", "/reload after installed-guidance changes",
+    ):
+        assert guidance in prompt
+    for removed_tool in ("record_memory", "update_memory", "suppress_memory", "delete_memory"):
+        assert removed_tool not in prompt
