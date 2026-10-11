@@ -2689,7 +2689,7 @@ class ProjectLiveSessionBuffer:
                 f"Title: {_one_line_text(row.title, '(none)')}",
                 f"Description: {_one_line_text(row.description, '(none)')}",
                 f"Kind: {_one_line_text(row.kind, '(unknown)')}",
-                f"Child/RLM: {'yes' if row.kind.lower().startswith('rlm') or row.supervisor_id else 'not indicated'}",
+                f"Child/RLM: {'yes' if row.kind.lower().startswith('rlm') else 'not indicated'}",
                 f"Hostname: {_one_line_text(row.hostname, '(unknown)')}; PID: {row.pid}",
                 f"Lifecycle status: {_one_line_text(row.status, '(unknown)')}; process state: {health}",
                 f"Observation (UTC): {_format_utc(observation.observed_at if observation else None)}; age: {age}",

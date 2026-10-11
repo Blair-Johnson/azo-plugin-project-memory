@@ -115,6 +115,20 @@ def test_per_instance_current_rlm_liveness_and_allowlisted_metadata(tmp_path, mo
     assert len(history.calls[-1]) == 2 and len(calls) == 1
 
 
+@pytest.mark.parametrize("supervisor_id", ["", "runtime-supervisor"])
+@pytest.mark.parametrize(("kind", "expected"), [
+    ("session", "not indicated"),
+    ("default", "not indicated"),
+    ("rlm", "yes"),
+])
+def test_child_label_uses_kind_not_process_supervision(
+    tmp_path, monkeypatch, kind, expected, supervisor_id,
+):
+    rows = [record(kind=kind, supervisor_id=supervisor_id)]
+    _, _, _, _, text = opened(tmp_path, monkeypatch, rows)
+    assert f"Kind: {kind}\nChild/RLM: {expected}\n" in text
+
+
 @pytest.mark.parametrize(("endpoint", "expected"), [
     ("ws://127.0.0.1:8123/agent", "ws://127.0.0.1:8123/agent"),
     ("wss://user:SECRET@example.test:8123/agent?token=SECRET#SECRET",
