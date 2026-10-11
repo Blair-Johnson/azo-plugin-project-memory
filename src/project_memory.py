@@ -542,7 +542,7 @@ def _build_full_transcript(
         f"Catalog Updated (UTC): {_format_utc(session.get('updated_at'))}",
         f"Buffer Generated (UTC): {_format_utc(generated_at)}",
         "View: Full saved transcript",
-        "Order: Oldest entry first (canonical document order); message positions are zero-based.",
+        "Order: Newest entry first (reverse canonical document order); messages within each entry remain chronological; message positions are zero-based.",
         f"Source Commit: {commit_id}",
         f"Source Instance: {instance_id}",
         f"Source Format: {source_format}",
@@ -624,7 +624,9 @@ def _build_full_transcript(
             records.append((rp, record, request, reason))
         entry_records[ep] = records
 
-    for ep, entry in enumerate(entries):
+    # Correlate requests/results chronologically above; reverse only display order.
+    for ep in reversed(range(len(entries))):
+        entry = entries[ep]
         if not isinstance(entry, Mapping):
             lines.extend(["", f"[document entry position {ep}: unsupported entry omitted]"])
             continue

@@ -31,7 +31,7 @@ def record(cid="call-1", name="terminal_run", args='{"command":"pwd"}', **extra)
     return dict(id=cid, name=name, raw_args=args, parsed_args={}, **extra)
 
 
-def test_chronological_messages_provenance_flags_and_stored_events():
+def test_newest_entries_first_with_chronological_messages_provenance_and_stored_events():
     entries = [
         {"index": 8, "step": 2, "event_time": {"wall_time": 123.0},
          "messages": [{"role": "user", "content": "first question"},
@@ -40,14 +40,51 @@ def test_chronological_messages_provenance_flags_and_stored_events():
          "messages": [{"role": "system", "content": "stored interrupt event"},
                       {"role": "assistant", "_responses_phase": "final", "content": "last answer"}]},
     ]
+    before = deepcopy(entries)
     text = render(entries)
-    assert text.index("first question") < text.index("checking first") < text.index("stored interrupt event") < text.index("last answer")
-    for expected in ("Oldest entry first", "entry 8, message 1", "ENTRY 11",
+    assert entries == before
+    assert text.index("stored interrupt event") < text.index("last answer") < text.index("first question") < text.index("checking first")
+    for expected in ("Newest entry first", "messages within each entry remain chronological",
+                     "entry 8, message 1", "ENTRY 11 [document position 1]",
                      'Message channel: "commentary"', 'Message _responses_phase: "final"',
                      "Entry compressed: true", "Entry forgotten: true", "Entry system_generated: true",
                      "123.0", "pinned-commit", "source-instance", "Source Format: journal",
                      "not journal file lines", "unsaved/live activity"):
         assert expected in text
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_tail_is_visible_in_first_200_lines(historical):
+    entries = [
+        {"index": index, "messages": [{"role": "user", "content": f"question-{index:03d}"}]}
+        for index in range(100)
+    ]
+    document = {"entries": entries}
+    if historical:
+        document = {"state": document}
+    text = render(document=document)
+    first_page = "\n".join(text.splitlines()[:200])
+    assert "question-099" in first_page
+    assert "question-000" not in first_page
+    assert [line for line in text.splitlines() if line.startswith("=== ENTRY")] == [
+        f"=== ENTRY {index} [document position {index}] ===" for index in reversed(range(100))
+    ]
+
+
+def test_reverse_document_order_preserves_fallback_positions_and_unsupported_entries():
+    text = render([
+        {"index": 40, "messages": [{"role": "user", "content": "oldest"}]},
+        None,
+        {"messages": [{"role": "assistant", "content": "middle"}]},
+        {"index": 3, "messages": [{"role": "assistant", "content": "newest"}]},
+    ])
+    markers = ["=== ENTRY 3 [document position 3] ===",
+               "=== ENTRY 2 [document position 2] ===",
+               "[document entry position 1: unsupported entry omitted]",
+               "=== ENTRY 40 [document position 0] ==="]
+    positions = [text.index(marker) for marker in markers]
+    assert positions == sorted(positions)
+    assert "ASSISTANT [entry 2, message 0]" in text
 
 
 def test_historical_state_shape_and_empty_document():
@@ -171,7 +208,8 @@ def test_result_in_later_entry_is_message_first_and_enriched_without_duplication
     assert text.count("UNIQUE_RESULT") == 1
     assert "Stored error: true" in text
     assert "Result represented at entry 3, message 0" in text
-    assert text.index("ENTRY 3") < text.index("UNIQUE_RESULT")
+    assert text.index("ENTRY 3") < text.index("UNIQUE_RESULT") < text.index("ENTRY 2")
+    assert "TOOL RESULT id=call-1 (request entry 2, message 0, call 0)" in text
 
 
 def test_provider_activity_blocks_artifact_refs_and_opaque_payload_omissions():

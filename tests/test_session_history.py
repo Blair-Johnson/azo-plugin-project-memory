@@ -431,7 +431,7 @@ def test_full_and_compact_share_pin_in_either_order(tmp_path, monkeypatch, full_
     assert f"Full buffer: {ALIAS}_full" in compact.text
     assert f"Compact buffer: {ALIAS}" in full.text
     assert "tool preamble" not in compact.text and "tool preamble" in full.text
-    assert full.text.index("Old question") < full.text.index("New question")
+    assert full.text.index("New question") < full.text.index("Old question")
     assert compact.text.index("New question") < compact.text.index("Old question")
     assert len(component._pins) == 1 and not component._requests
     assert component._text_bytes == sum(size for _, size in component._texts.values())
