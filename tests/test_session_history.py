@@ -349,7 +349,8 @@ def test_project_roots_isolate_identical_aliases(tmp_path, monkeypatch):
     assert first.path != second.path and len(component._pins) == 2
 
 
-def test_real_journal_registration_readonly_and_persistence_restore(tmp_path):
+@pytest.mark.parametrize("full", [False, True])
+def test_real_journal_registration_readonly_and_persistence_restore(tmp_path, full):
     projects.ensure_project("demo")
     root = tmp_path / "home" / "projects" / "demo"
     local = tmp_path / "local"
@@ -380,6 +381,9 @@ def test_real_journal_registration_readonly_and_persistence_restore(tmp_path):
         session.state._agent_zoo_context = dict(project_name="demo", project_dir=str(root), local_state_root=str(local))
         component = next(c for c in flatten(session.pipeline) if isinstance(c, pm.ProjectSessionBuffers))
         component(session.state)
+        live = next(c for c in flatten(session.pipeline) if isinstance(c, pm.ProjectLiveSessionBuffer))
+        live(session.state)
+        assert session.state.buffer_manager.resolve_for_read(session.state, "live_sessions").readonly
         wait_for(lambda: "Inventory: ready" in component.render_index(session.state).text)
         return session
     try:
@@ -388,11 +392,13 @@ def test_real_journal_registration_readonly_and_persistence_restore(tmp_path):
         session = viewer()
         def read(session):
             session.state.step += 1
-            return session.state.buffer_manager.resolve_for_read(session.state, ALIAS)
+            return session.state.buffer_manager.resolve_for_read(session.state, ALIAS + ("_full" if full else ""))
         view = wait_for(lambda: (v if "Source Commit:" in (v := read(session)).text else None))
         assert f"Source Commit: {commit}" in view.text and "Source Format: journal" in view.text
         assert "Journal answer" in view.text and not locator.exists()
         assert view.readonly
+        with pytest.raises(ValueError, match="readonly"):
+            session.state.buffer_manager.require_writable(ALIAS + ("_full" if full else ""))
         target = root / "sessions" / CURRENT / "session.json"
         persistence = SessionPersistence(target, session_id=CURRENT, instance_id="viewer", local_state_root=local)
         writers.append(persistence)
@@ -405,3 +411,161 @@ def test_real_journal_registration_readonly_and_persistence_restore(tmp_path):
     finally:
         for persistence in writers:
             persistence.close()
+
+
+@pytest.mark.parametrize("full_first", [False, True])
+def test_full_and_compact_share_pin_in_either_order(tmp_path, monkeypatch, full_first):
+    component, observer, root, now = opened(tmp_path)
+    commits = []
+    def request(locator, **kwargs):
+        commits.append(kwargs["commit_id"])
+        return loaded(commit=kwargs["commit_id"] or f"revision-{len(commits)}")
+    monkeypatch.setattr(session_load, "load_session", request)
+    aliases = [ALIAS + "_full", ALIAS] if full_first else [ALIAS, ALIAS + "_full"]
+    views = {alias: component.render_session(observer, alias) for alias in aliases}
+    assert commits == [None, "revision-1"]
+    compact, full = views[ALIAS], views[ALIAS + "_full"]
+    assert compact.readonly and full.readonly
+    assert compact.path.endswith("/commits/revision-1")
+    assert full.path.endswith("/commits/revision-1/full")
+    assert f"Full buffer: {ALIAS}_full" in compact.text
+    assert f"Compact buffer: {ALIAS}" in full.text
+    assert "tool preamble" not in compact.text and "tool preamble" in full.text
+    assert full.text.index("Old question") < full.text.index("New question")
+    assert compact.text.index("New question") < compact.text.index("Old question")
+    assert len(component._pins) == 1 and not component._requests
+    assert component._text_bytes == sum(size for _, size in component._texts.values())
+    now[0] += 10
+    assert component.render_session(observer, ALIAS + "_full").text == full.text
+    # Eviction is not refresh for either projection.
+    component._texts.clear()
+    component._text_bytes = 0
+    monkeypatch.setattr(pm, "SESSION_PROJECTION_CACHE_BYTES", 1)
+    for alias in aliases:
+        assert component.render_session(observer, alias).text == views[alias].text
+    assert commits[-2:] == ["revision-1", "revision-1"]
+    assert not component._texts and component._text_bytes == 0
+
+
+def test_registry_issued_aliases_do_not_need_catalog_membership(tmp_path, monkeypatch):
+    component, observer, root, _ = opened(tmp_path, rows=[])
+    aliases = component.issue_sessions(observer, [row(), row(), dict(row(CURRENT), kind="rlm"),
+                                                 {"session_id": "../bad"}, {}])
+    assert set(aliases) == {FIRST, CURRENT}
+    monkeypatch.setattr(session_load, "load_session", lambda locator, **kw: loaded(kw["session_id"]))
+    for sid, alias in aliases.items():
+        assert f"Session ID: {sid}" in component.render_session(observer, alias + "_full").text
+    assert "Known title" not in component.render_index(observer).text
+    collision = "344655c1-2222-2222-2222-222222222222"
+    added = component.issue_sessions(observer, [row(collision)])
+    assert added[collision] != aliases[FIRST]
+    assert component.issue_sessions(observer, [row()])[FIRST] == aliases[FIRST]
+
+
+@pytest.mark.parametrize("alias", ["ses_344655c1_full_full", "ses_344655c1/full", "ses_short_full"])
+def test_full_namespace_rejects_malformed_ids(tmp_path, alias):
+    component, observer, _, _ = opened(tmp_path)
+    assert component.render_session(observer, alias) is None
+
+
+def test_simultaneous_variants_share_pending_load(tmp_path, monkeypatch):
+    component, observer, _, _ = opened(tmp_path)
+    handle, entered = pending(tmp_path), threading.Event()
+    calls = []
+    def request(locator, **kwargs):
+        calls.append(kwargs["commit_id"])
+        if kwargs["commit_id"]:
+            return loaded(commit=kwargs["commit_id"])
+        entered.set()
+        return handle
+    monkeypatch.setattr(session_load, "load_session", request)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(component.render_session, observer, ALIAS + "_full")
+        assert entered.wait(2)
+        second = pool.submit(component.render_session, observer, ALIAS)
+        assert second.result(timeout=2).path.endswith("/pending")
+        assert calls == [None] and len(component._requests) == 1
+        handle._value = loaded()
+        handle._done.set()
+        first_view = first.result(timeout=2)
+    # The first wait may have timed out on a heavily loaded test host.
+    if first_view.path.endswith("/pending"):
+        first_view = component.render_session(observer, ALIAS + "_full")
+    compact = component.render_session(observer, ALIAS)
+    assert "Source Commit: first" in first_view.text and "Source Commit: first" in compact.text
+    assert calls == [None, "first"]
+    assert not component._requests
+
+
+def test_registry_navigation_to_full_saved_tool_history(tmp_path, monkeypatch):
+    from agent_utils import ToolCall
+    from agent_zoo.live_session_registry import LiveSessionRecord, LiveProcessObservation
+    from tmux_pilot.fs_store import RecordStore
+    from tmux_pilot.process_identity import ProcessIdentity, ObservationState
+
+    projects.ensure_project("demo")
+    root = tmp_path / "home" / "projects" / "demo"
+    local = tmp_path / "local"
+    paths = ["/fixtures/backend-worktrees/topic", "/fixtures/tui-worktrees/topic"]
+    args = json.dumps({"command": f"git worktree add {paths[0]} topic; git worktree add {paths[1]} topic"})
+    call = ToolCall("make", "terminal_run", args, json.loads(args), result="Fixture checkout prepared")
+    source = Session()
+    source.state._session_id = FIRST
+    source.state.entries = [
+        Entry(index=0, step=0, messages=[{"role": "user", "content": "Implement the feature"}]),
+        Entry(index=1, step=1, messages=[
+            {"role": "assistant", "content": "Preparing checkouts", "tool_calls": [
+                {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": args}}]},
+            {"role": "tool", "tool_call_id": call.id, "content": call.result},
+        ], tool_calls=[call]),
+        Entry(index=2, step=2, messages=[{"role": "assistant", "content": "Implemented; final answer omits paths"}]),
+    ]
+    writer = SessionPersistence(root / "sessions" / FIRST / "session.json", session_id=FIRST,
+                                instance_id="saved-instance", local_state_root=local)
+    try:
+        receipt = writer.save(source, exclude_attrs=SESSION_PERSISTENCE_EXCLUDED_ATTRS)
+        assert receipt.local_saved
+        assert writer.wait_for_shared(receipt.revision_id, timeout_s=4).shared_saved
+        stamp = time.time()
+        live_row = LiveSessionRecord(
+            session_id=FIRST, instance_id="live-instance", pid=123, status="running",
+            websocket_url="ws://127.0.0.1:8123", title="Feature work",
+            process_identity=ProcessIdentity("fixture-host", "fixture-boot", "fixture-ns", 123, "fixture-start"),
+            process_observation=LiveProcessObservation(ObservationState.ALIVE, "fixture", stamp, 1),
+        )
+        RecordStore(root / "coordination").put("live", live_row.instance_id, live_row.to_value())
+        observer = state(root)
+        observer._agent_zoo_context["local_state_root"] = str(local)
+        history = pm.ProjectSessionBuffers()
+        live = pm.ProjectLiveSessionBuffer(history=history)
+        history(observer)
+        live(observer)
+        def read(alias):
+            observer.step += 1
+            return observer.buffer_manager.resolve_for_read(observer, alias)
+        text = wait_for(lambda: (v.text if "Saved history:" in (v := read("live_sessions")).text else None))
+        assert f"{ALIAS} | {ALIAS}_full" in text
+        compact = wait_for(lambda: (v if "Source Commit:" in (v := read(ALIAS)).text else None))
+        full = wait_for(lambda: (v if "Source Commit:" in (v := read(ALIAS + "_full")).text else None))
+        for path in paths:
+            assert path not in compact.text and path in full.text
+        assert full.text.count(args) == 1
+        assert "Source Instance: saved-instance" in full.text and "live-instance" in text
+        assert f"Source Commit: {receipt.revision_id}" in compact.text
+        assert f"Source Commit: {receipt.revision_id}" in full.text
+        lines = full.text.splitlines()
+        line = next(i for i, value in enumerate(lines) if "git worktree add" in value)
+        assert "LOCAL FUNCTION REQUEST" in "\n".join(lines[max(0, line - 2):line + 2])
+        assert read("live_sessions").readonly and full.readonly
+    finally:
+        writer.close()
+
+
+def test_registry_only_session_without_saved_history_reports_unavailable(tmp_path):
+    component, observer, root, _ = opened(tmp_path, rows=[])
+    alias = component.issue_sessions(observer, [row()])[FIRST] + "_full"
+    view = wait_for(lambda: (v if v.path.endswith("/unavailable") else None)
+                    if (v := component.render_session(observer, alias)) else None)
+    assert view.readonly
+    assert "No saved entries recorded" not in view.text
+    assert not (root / "sessions" / FIRST / "session.json").exists()

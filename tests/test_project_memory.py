@@ -591,6 +591,7 @@ def test_feature_contains_all_tools_and_special_buffer(monkeypatch):
         pm.ProjectMemoryStore,
         pm.ProjectMemoryBuffer,
         pm.ProjectSessionBuffers,
+        pm.ProjectLiveSessionBuffer,
         pm.RecordMemory,
         pm.UpdateMemory,
         pm.SuppressMemory,
@@ -634,6 +635,12 @@ def test_real_harness_pipelines_build_with_project_memory(
     types = [type(component) for component in pipeline]
     assert pm.ProjectMemoryBuffer in types
     assert pm.ProjectSessionBuffers in types
+    assert pm.ProjectLiveSessionBuffer in types
+    def position(kind):
+        return next(i for i, component in enumerate(pipeline) if isinstance(component, kind))
+    assert position(pm.RegisterSpecialBuffers) < position(pm.ProjectSessionBuffers)
+    assert position(pm.ProjectSessionBuffers) < position(pm.ProjectLiveSessionBuffer)
+    assert position(pm.ProjectLiveSessionBuffer) < position(pm.ToolDispatchStart)
     assert pm.ProjectMemoryRecall in types
     assert pm.ProjectMemoryDelivery in types
     assert pm.ProjectMemorySystemPrompt in types

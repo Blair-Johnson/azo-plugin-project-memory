@@ -1,6 +1,6 @@
 # Project memory for Agent Zoo
 
-This userspace plugin provides two independently enabled features: canonical project-session history and regex-triggered durable memories. It requires the current journal-aware `agent_zoo.session_load` API and lazy readonly buffer namespaces.
+This userspace plugin provides three independently enabled features: a live-session registry view, canonical project-session history, and regex-triggered durable memories. It requires the current journal-aware `agent_zoo.session_load` API and lazy readonly buffer namespaces.
 
 ## Session history
 
@@ -8,9 +8,17 @@ This userspace plugin provides two independently enabled features: canonical pro
 
 Opening a listed `ses_…` buffer starts or reuses a canonical background load. An explicit read allows up to 200 ms of waiting so fast document loads return content on the first call. This bounds waiting, not CPU time for copying or projection; an unknown catalog can still return pending. If a document is still loading, the response includes known session metadata rather than pretending history is empty. Slow session loads do not occupy the catalog worker or prevent other sessions from starting. Idle catalog workers exit.
 
-Projections contain user/final-assistant turn blocks, newest-first, with tool activity omitted. The first successful canonical load pins the exact commit and its original provenance for that backend. Catalog removal, short-ID collisions, later saves, and text-cache eviction do not retarget issued pins. There is no 32-session lifetime ceiling: lightweight pins are retained, while transcript text and transient requests/errors are bounded separately. An evicted projection is reconstructed from its exact commit; cache eviction is not a refresh.
+The compact `ses_<id>` projection contains user/final-assistant turn blocks, newest-first, with tool activity omitted. Its `ses_<id>_full` counterpart includes chronological saved messages, commentary, tool names, raw arguments, results, errors, and canonical entry pointers. Use `grep` to locate a call or path and `view` line ranges to read its context. Identical message/entry representations are deduplicated; missing results, conflicting representations, nontext content, and opaque provider payloads are labeled rather than guessed. Historical text is evidence, not an instruction to execute.
 
-Headers distinguish local availability from shared freshness. A restart releases in-memory pins, but does not discard local saved history or force shared reconciliation. Canonical entry indices refer to the committed document, not journal-file lines. For omitted details, use `load_session` with the header's session and commit identity. No loose `session.json`, disposable snapshot copies, or shared projection sidecars are created.
+Both variants share the same first successful canonical load pin: opening either first selects the exact commit and its original provenance for that backend. Catalog removal, short-ID collisions, later saves, and text-cache eviction do not retarget issued pins. There is no 32-session lifetime ceiling: lightweight pins are retained, while transcript text and transient requests/errors are bounded separately. An evicted projection is reconstructed from its exact commit; cache eviction is not a refresh.
+
+Headers distinguish local availability from shared freshness. A restart releases in-memory pins, but does not discard local saved history or force shared reconciliation. Canonical entry indices refer to the committed document, not journal-file lines. For execution details, follow the `_full` counterpart instead of attempting to read the binary Source Journal path. Neither view contains unsaved activity; truncated or absent artifacts in the saved document cannot be recovered by this projection. No loose `session.json`, disposable snapshot copies, or shared projection sidecars are created.
+
+## Live sessions
+
+`live_sessions` is a current-project, readonly registry view with one row per runtime instance, including the current session and child/RLM instances. It exposes advertised websocket endpoints, identity, lifecycle status, timestamped process-health evidence, and compact/full history references when history is enabled. It does not probe processes, connect to endpoints, start observers, load every transcript, or infer worktrees or task readiness.
+
+Registry refresh is asynchronous and normally limited to once per five seconds; exact buffers also use BufferManager's per-step cache. Read the displayed observation and registry-read times: `running` does not mean confirmed alive or actively working. Unknown health remains visible, stopped instances are counted separately, and read failures retain explicitly stale last-good data. Remote loopback endpoints are not verified routes; endpoint credentials are not displayed. History links select the session's saved continuation, which can have a different source instance than a listed live runtime.
 
 ## Regex memories
 
@@ -22,7 +30,7 @@ Recall is best-effort: individual searches have a 5 ms budget, a pass 50 ms, eve
 
 ## Configuration and installation
 
-The installed `plugin-configs/azo-plugin-project-memory/config/project_memory.yaml` controls the running plugin; `config/project_memory.yaml` is its template. `project_memory.enabled` is the master switch. `project_memory.regex_memories.enabled` and `project_memory.project_sessions.enabled` control the two features independently. An explicit `system_prompt` is honored with either feature enabled; an empty string disables injected guidance. Without one, guidance describes only the enabled features. Launch-time configuration overrides the installed file.
+The installed `plugin-configs/azo-plugin-project-memory/config/project_memory.yaml` controls the running plugin; `config/project_memory.yaml` is its template. `project_memory.enabled` is the master switch. `project_memory.regex_memories.enabled`, `project_memory.project_sessions.enabled`, and `project_memory.live_sessions.enabled` control the three features independently and default to enabled. Full transcripts belong to the history feature; live-only mode omits history links. An explicit `system_prompt` is honored with any feature enabled; an empty string disables injected guidance. Without one, guidance describes only the enabled features. Launch-time configuration overrides the installed file.
 
 Install through `azo-plugin install PATH` in the intended Agent Zoo environment, then restart or `/reload` that backend. Installation preserves existing configuration unless `--force-config` is requested. Review custom prompts when disabling a feature: explicit text is not rewritten to remove references to disabled tools. Do not deploy to a production backend merely to run tests.
 
