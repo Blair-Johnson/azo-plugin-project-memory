@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in, provider-free canonical history/memory workflow; never run on live state.
+"""Opt-in, provider-free canonical session-history workflow; never run on live state.
 
 Requires an existing compatible AZ/AU/TP environment and this checkout's src on
 PYTHONPATH. --root must not exist. Retains a tiny private home/spool and prints
@@ -68,7 +68,7 @@ def main():
     projects.configure_state_root(home)
     projects.ensure_project(project)
     project_dir = home / "projects" / project
-    stores, writers = [], []
+    writers = []
 
     def turn(session, marker):
         for role, text in (("user", marker), ("assistant", "answer " + marker)):
@@ -76,28 +76,25 @@ def main():
                 messages=[{"role": role, "content": text}],
                 index=len(session.state.entries), step=session.state.step))
 
-    def plugin_session(regex=True, history=True, enabled=True, document=None):
+    def plugin_session(history=True, live=True, enabled=True):
         session = Session(system_prompt="Private diagnostic; no provider calls.")
         session.state.buffer_manager = BufferManager()
         builder = PipelineBuilder(session).add(core()).add(buffer_editing())
         pm.register_features(builder, session=session, config={"project_memory": {
-            "enabled": enabled, "regex_memories": {"enabled": regex},
-            "project_sessions": {"enabled": history}, "include_bundled_memories": False}})
+            "enabled": enabled,
+            "project_sessions": {"enabled": history},
+            "live_sessions": {"enabled": live}}})
         session.pipeline = builder.build()
-        if document is not None:
-            session.load_document(document)
         session._init_state()
         session.state._session_id = getattr(session.state, "_session_id", str(uuid.uuid4()))
         session.state._agent_zoo_context = {
             "project_name": project, "project_dir": str(project_dir),
             "local_state_root": str(local)}
         components = {type(item): item for item in flatten(session.pipeline)}
-        if pm.ProjectMemoryStore in components:
-            stores.append(components[pm.ProjectMemoryStore])
         return session, components
 
     def attach(session, components):
-        for cls in (pm.ProjectMemoryStore, pm.ProjectMemoryBuffer, pm.ProjectSessionBuffers):
+        for cls in (pm.ProjectSessionBuffers, pm.ProjectLiveSessionBuffer):
             if cls in components:
                 components[cls](session.state)
 
@@ -129,33 +126,37 @@ def main():
         emit("save", **shared.to_dict())
         return receipt.revision_id
 
-    def close_store(store):
-        store.close(timeout_s=2)
-        require(not store.worker_alive, "private memory worker did not stop")
-
-    def published(store):
-        wait_for(store.snapshot_status,
-                 lambda value: value["ready"] and not value["pending_operations"]
-                 and not value["conflicts"], "memory publication failed")
+    def restore(locator, sid, commit):
+        loaded = load_session(locator, session_id=sid, commit_id=commit,
+                              local_state_root=local, timeout_s=0)
+        if isinstance(loaded, PendingSessionLoad):
+            loaded = loaded.wait(timeout_s=10)
+        require(not isinstance(loaded, PendingSessionLoad), "exact reload stayed pending")
+        require(loaded.state.commit_id == commit, "exact reload selected another commit")
+        restored = Session()
+        restored.load_document(loaded.state.document)
+        restored._init_state()
+        return str([entry.messages for entry in restored.state.entries])
 
     try:
-        for regex, history, enabled in ((True, True, True), (True, False, True),
-                                        (False, True, True), (False, False, True),
-                                        (True, True, False)):
-            session, components = plugin_session(regex, history, enabled)
-            require((pm.RecordMemory in components) == (regex and enabled), "regex control coupled")
-            require((pm.ProjectSessionBuffers in components) == (history and enabled), "history control coupled")
+        for history, live, enabled in ((True, True, True), (True, False, True),
+                                       (False, True, True), (False, False, True),
+                                       (True, True, False)):
+            session, components = plugin_session(history, live, enabled)
+            require((pm.ProjectSessionBuffers in components) == (history and enabled),
+                    "history control coupled")
+            require((pm.ProjectLiveSessionBuffer in components) == (live and enabled),
+                    "live control coupled")
             attach(session, components)
             manager = session.state.buffer_manager
-            require(manager.is_special("project_memory") == (regex and enabled), "memory buffer control coupled")
-            require(manager.is_special("project_sessions") == (history and enabled), "history buffer control coupled")
-            require(manager.is_special("ses_12345678") == (history and enabled), "history namespace control coupled")
-            emit("controls", regex=regex, history=history, enabled=enabled)
-            if pm.ProjectMemoryStore in components:
-                close_store(components[pm.ProjectMemoryStore])
+            require(manager.is_special("project_sessions") == (history and enabled),
+                    "history buffer control coupled")
+            require(manager.is_special("ses_12345678") == (history and enabled),
+                    "history namespace control coupled")
+            require(manager.is_special("live_sessions") == (live and enabled),
+                    "live buffer control coupled")
+            emit("controls", history=history, live=live, enabled=enabled)
 
-        viewer, components = plugin_session()
-        attach(viewer, components)
         for mixed in (False, True):
             sid = str(uuid.uuid4())
             source = Session(system_prompt="Private journal history source.")
@@ -175,7 +176,7 @@ def main():
             first = save(source, persistence)
             projects.register_session(project, sid, title=marker)
             # Cold local root forces a real shared mixed-repository read.
-            observer, observed_components = plugin_session(regex=False)
+            observer, observed_components = plugin_session(live=False)
             observer.state._agent_zoo_context["local_state_root"] = str(root / "cold-local")
             attach(observer, observed_components)
             buffer_id, pinned = projection(observer, sid, marker, first)
@@ -183,96 +184,34 @@ def main():
             second = save(source, persistence)
             require(first != second, "new turn did not produce a new commit")
             require(read_buffer(observer, buffer_id) == pinned, "existing buffer silently retargeted")
-            restarted, restarted_components = plugin_session(regex=False)
+            restarted, restarted_components = plugin_session(live=False)
             attach(restarted, restarted_components)
             projection(restarted, sid, "after-pin-" + sid, second)
-            loaded = load_session(locator, session_id=sid, commit_id=first,
-                                  local_state_root=local, timeout_s=0)
-            if isinstance(loaded, PendingSessionLoad):
-                loaded = loaded.wait(timeout_s=10)
-            require(not isinstance(loaded, PendingSessionLoad), "exact reload stayed pending")
-            require(loaded.state.commit_id == first, "exact reload selected another commit")
-            restored = Session()
-            restored.load_document(loaded.state.document)
-            restored._init_state()
-            content = str([entry.messages for entry in restored.state.entries])
+            content = restore(locator, sid, first)
             require(marker in content and "after-pin-" + sid not in content, "exact restore changed history")
             require(not locator.exists(), "journal save created a loose snapshot")
             emit("history_restore", mixed=mixed, first=first, second=second, stable_pin=True)
 
-        store = components[pm.ProjectMemoryStore]
-        result = components[pm.RecordMemory].execute(viewer.state,
-                    content="private durable memory", trigger="probe-recall-token")
-        memory_id = store.list_all(viewer.state)[0]["id"]
-        published(store)
-        emit("record_memory", result=result, receipt=store.receipt(memory_id))
-        turn(viewer, "probe-recall-token")
-        components[pm.ProjectMemoryRecall](viewer.state)
-        require(any(item["id"] == memory_id for item in getattr(viewer.state, pm.PENDING_RECALLS_ATTR)),
-                "regex memory did not recall")
-        components[pm.SuppressMemory].execute(viewer.state, id=memory_id, turns=20)
-        require(memory_id in getattr(viewer.state, pm.SUPPRESSIONS_ATTR), "suppression missing")
-        require(not getattr(viewer.state, pm.PENDING_RECALLS_ATTR), "suppressed recall still pending")
-        close_store(store)
+            # Block shared history after a successful local restore. An issued
+            # alias stays pinned, and canonical restore can use the local journal.
+            shared_root = locator.parent
+            parked = shared_root.with_name(sid + "-offline")
+            shared_root.rename(parked)
+            try:
+                shared_root.write_text("Private diagnostic outage: not a directory\n")
+                require(read_buffer(observer, buffer_id) == pinned,
+                        "pinned history changed during shared outage")
+                require(restore(locator, sid, first) == content,
+                        "local exact restore changed during shared outage")
+                emit("history_outage", mixed=mixed, commit_id=first,
+                     stable_pin=True, local_restore=True)
+            finally:
+                shared_root.unlink(missing_ok=True)
+                parked.rename(shared_root)
 
-        shared_root = project_dir / "plugin-data" / "project-memory"
-        parked = shared_root.with_name("project-memory-offline")
-        shared_root.rename(parked)
-        shared_root.write_text("Private diagnostic outage: not a directory\n")
-        offline, offline_components = plugin_session()
-        attach(offline, offline_components)
-        offline_store = offline_components[pm.ProjectMemoryStore]
-        require(offline_store.get(offline.state, memory_id)["content"] == "private durable memory",
-                "last-good memory disappeared during outage")
-        result = offline_components[pm.UpdateMemory].execute(
-            offline.state, id=memory_id, content="private queued update")
-        require(offline_store.receipt(memory_id)["local_saved"], "update not locally durable")
-        require(not offline_store.receipt(memory_id)["shared_saved"], "outage claimed shared update")
-        offline_components[pm.SuppressMemory].execute(offline.state, id=memory_id, turns=20)
-        close_store(offline_store)
-        sid = offline.state._session_id
-        locator = project_dir / "sessions" / sid / "session.json"
-        persistence = SessionPersistence(locator, session_id=sid, instance_id=uuid.uuid4().hex,
-                                         local_state_root=local)
-        writers.append(persistence)
-        commit = save(offline, persistence)
-        restored, restored_components = plugin_session(document=persistence.load(commit_id=commit).document)
-        attach(restored, restored_components)
-        restored_store = restored_components[pm.ProjectMemoryStore]
-        require(restored_store.get(restored.state, memory_id)["content"] == "private queued update",
-                "queued update lost across canonical restore")
-        require(restored_store.snapshot_status()["last_good"], "last-good cache lost across restore")
-        require(memory_id in getattr(restored.state, pm.SUPPRESSIONS_ATTR),
-                "durable session suppression lost across restore")
-        require("private queued update" in read_buffer(restored, "project_memory"),
-                "restored memory buffer did not expose queued update")
-        emit("offline_restore", result=result, status=restored_store.snapshot_status(), commit_id=commit)
-        close_store(restored_store)
-        shared_root.unlink()
-        parked.rename(shared_root)
-        recovered, recovered_components = plugin_session()
-        attach(recovered, recovered_components)
-        recovered_store = recovered_components[pm.ProjectMemoryStore]
-        published(recovered_store)
-        require(recovered_store.get(recovered.state, memory_id)["content"] == "private queued update",
-                "recovered update missing")
-        result = recovered_components[pm.DeleteMemory].execute(recovered.state, id=memory_id)
-        published(recovered_store)
-        close_store(recovered_store)
-        final, final_components = plugin_session()
-        attach(final, final_components)
-        final_store = final_components[pm.ProjectMemoryStore]
-        published(final_store)
-        require(final_store.get(final.state, memory_id) is None, "deletion lost on restart")
-        from tmux_pilot.fs_store import RecordStore
-        tombstone = RecordStore(shared_root, create=False).get("project_memory", memory_id)
-        require(tombstone and tombstone["deleted"], "shared tombstone missing")
-        emit("delete_memory", result=result, tombstone=tombstone)
         emit("complete", status="PASS", root=root,
              limits="component/filesystem workflow only; no backend/TUI/provider or NFS qualification")
     finally:
-        for store in stores:
-            store.close(timeout_s=2)
         for persistence in writers:
             persistence.close(timeout_s=2)
 

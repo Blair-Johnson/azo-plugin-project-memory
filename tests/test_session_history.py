@@ -372,7 +372,7 @@ def test_real_journal_registration_readonly_and_persistence_restore(tmp_path, fu
         session.state.buffer_manager = BufferManager()
         builder = PipelineBuilder(session).add(core()).add(buffer_editing())
         pm.register_features(builder, session=session, config={"project_memory": {
-            "regex_memories": False, "project_sessions": True}})
+            "project_sessions": True}})
         session.pipeline = builder.build()
         if document is not None:
             session.load_document(document)
