@@ -6,6 +6,7 @@ import pytest
 from agent_utils import Entry, Session, State
 from agent_zoo import pipelines
 from agent_zoo.modes import default_modes, rlm_modes
+from agent_zoo.runtime.settings import Setting, SettingsContext, SettingsRegistry
 
 import project_memory as pm
 
@@ -52,9 +53,10 @@ def test_feature_contains_history_and_live_buffers(monkeypatch):
     features = []
     pm.register_features(SimpleNamespace(add=features.append), session=None, config={})
 
-    assert len(features) == 1
-    assert features[0].name == "project_memory"
-    assert {type(component) for component in features[0].components} == {
+    assert len(features) == 2
+    assert features[0].name == "project_memory_settings"
+    assert features[-1].name == "project_memory"
+    assert {type(component) for component in features[-1].components} == {
         pm.ProjectSessionBuffers,
         pm.ProjectLiveSessionBuffer,
         pm.ProjectMemorySystemPrompt,
@@ -72,7 +74,8 @@ def _install_only_project_memory(builder, *, session, config, **_kwargs):
         (pipelines.build_readonly_rlm_pipeline, rlm_modes),
     ],
 )
-def test_real_harness_pipelines_build_with_project_memory(builder, modes, monkeypatch):
+def test_real_harness_pipelines_build_with_project_memory(builder, modes, monkeypatch, tmp_path):
+    monkeypatch.setenv(pm.CONFIG_PATH_ENV, str(tmp_path / "settings.yaml"))
     monkeypatch.setattr(pipelines, "apply_pipeline_plugins", _install_only_project_memory)
     monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
 
@@ -93,6 +96,12 @@ def test_real_harness_pipelines_build_with_project_memory(builder, modes, monkey
     assert pm.ProjectSessionBuffers in types
     assert pm.ProjectLiveSessionBuffer in types
     assert pm.ProjectMemorySystemPrompt in types
+    registry = SettingsRegistry([component for component in pipeline if isinstance(component, Setting)])
+    catalog = registry.handle({"type": "plugin_settings", "request_id": "test", "action": "list"},
+                              SettingsContext(session))
+    assert catalog["ok"] and catalog["error"] is None
+    assert len(catalog["settings"]) == 3
+    assert all(row["error"] is None for row in catalog["settings"])
 
     def position(kind):
         return next(i for i, component in enumerate(pipeline) if isinstance(component, kind))
@@ -122,7 +131,7 @@ def test_custom_prompt_respected_with_independent_features(
     features = []
     pm.register_features(SimpleNamespace(add=features.append), session=None,
                          config={"project_memory": section})
-    prompt = next(component for component in features[0].components
+    prompt = next(component for component in features[-1].components
                   if isinstance(component, pm.ProjectMemorySystemPrompt))
     assert prompt.text == expected
 
@@ -134,7 +143,7 @@ def test_config_template_preserves_detailed_session_guidance(monkeypatch):
     monkeypatch.setenv(pm.CONFIG_PATH_ENV, str(template))
     features = []
     pm.register_features(SimpleNamespace(add=features.append), session=None, config={})
-    prompt = next(component.text for component in features[0].components
+    prompt = next(component.text for component in features[-1].components
                   if isinstance(component, pm.ProjectMemorySystemPrompt))
     for guidance in (
         "substantial contiguous sequence of turns", "do not stop at the first turn",

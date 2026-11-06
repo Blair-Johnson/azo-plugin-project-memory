@@ -31,10 +31,11 @@ def test_independent_feature_toggles_match_installed_contract(
         }},
     )
     if not any((sessions_enabled, live_enabled)):
-        assert features == []
+        assert [feature.name for feature in features] == ["project_memory_settings"]
         return
-    assert len(features) == 1
-    components = features[0].components
+    assert len(features) == 2
+    assert features[0].name == "project_memory_settings"
+    components = features[-1].components
     types = {type(component) for component in components}
     assert (pm.ProjectSessionBuffers in types) == sessions_enabled
     assert (pm.ProjectLiveSessionBuffer in types) == live_enabled
@@ -104,7 +105,7 @@ def test_master_disable_is_preserved(monkeypatch, enabled):
     features = []
     pm.register_features(SimpleNamespace(add=features.append), session=None,
                          config={"project_memory": {"enabled": enabled}})
-    assert features == []
+    assert [feature.name for feature in features] == ["project_memory_settings"]
 
 
 @pytest.mark.parametrize("origin", ["installed", "launch"])
@@ -122,8 +123,9 @@ def test_legacy_memory_config_cannot_restore_tools_or_buffer(tmp_path, monkeypat
     pm.register_features(SimpleNamespace(add=features.append), session=None,
                          config=legacy if origin == "launch" else {})
 
-    assert len(features) == 1
-    components = features[0].components
+    assert len(features) == 2
+    assert features[0].name == "project_memory_settings"
+    components = features[-1].components
     assert {type(component) for component in components} == {
         pm.ProjectSessionBuffers, pm.ProjectLiveSessionBuffer, pm.ProjectMemorySystemPrompt,
     }

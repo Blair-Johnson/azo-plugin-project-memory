@@ -9,6 +9,8 @@ import operator
 import os
 import queue
 import re
+import stat
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -32,6 +34,7 @@ from agent_utils.files.buffer_manager import (
 )
 from agents.system_prompt import SystemPromptSkillList
 from agent_zoo.tools.special_buffers import RegisterSpecialBuffers
+from agent_zoo.runtime.settings import Setting, SettingError
 
 
 log = logging.getLogger("agent_zoo_user_plugin.project_memory")
@@ -1486,9 +1489,81 @@ def _subfeature_enabled(section: Mapping[str, Any], name: str) -> bool:
     return _config_enabled(value)
 
 
+def _read_settings_config(path: Path) -> dict[str, Any]:
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError, yaml.YAMLError):
+        raise SettingError("Cannot read project-memory settings") from None
+    if not isinstance(document, dict) or not isinstance(document.get(CONFIG_SECTION, {}), dict):
+        raise SettingError("Project-memory settings must contain YAML mappings")
+    return document
+
+
+def _write_setting(name: str, value: bool) -> None:
+    if type(value) is not bool:
+        raise SettingError("Project-memory settings require a boolean")
+    temporary = None
+    try:
+        path = ProjectMemorySystemPrompt._config_path().resolve()
+        document = _read_settings_config(path)
+        section = dict(document.get(CONFIG_SECTION, {}))
+        if name == "enabled":
+            section[name] = value
+        else:
+            existing = section.get(name, {})
+            if not isinstance(existing, (dict, bool, str)):
+                raise SettingError("Invalid project-memory subfeature settings")
+            section[name] = {**existing, "enabled": value} if isinstance(existing, dict) else value
+        document[CONFIG_SECTION] = section
+        text = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", delete=False) as stream:
+            temporary = Path(stream.name)
+            os.fchmod(stream.fileno(), mode)
+            stream.write(text)
+        os.replace(temporary, path)
+    except (OSError, UnicodeError, yaml.YAMLError):
+        raise SettingError("Cannot save project-memory settings") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _settings(config: Any) -> list[Setting]:
+    explicit = (config or {}).get(CONFIG_SECTION, {})
+    explicit = dict(explicit) if isinstance(explicit, Mapping) else {}
+
+    def read(name):
+        section = dict(_read_settings_config(ProjectMemorySystemPrompt._config_path())
+                       .get(CONFIG_SECTION, {}))
+        section.update(explicit)
+        return (_config_enabled(section.get(name, True)) if name == "enabled"
+                else _subfeature_enabled(section, name))
+
+    settings = []
+    for name, label in (("enabled", "Enabled"), ("project_sessions", "Session history"),
+                        ("live_sessions", "Live-session discovery")):
+        overridden = name in explicit
+        key = name if name == "enabled" else f"{name}.enabled"
+        settings.append(Setting(
+            key=f"project_memory.{key}", label=label, kind="bool",
+            get=lambda ctx, name=name: read(name),
+            set=None if overridden else lambda ctx, value, name=name: _write_setting(name, value),
+            group="Project memory", apply="reload",
+            help=("Effective launch override; edit launch configuration to change it."
+                  if overridden else "Configured value; reload the backend to apply changes."),
+        ))
+    return settings
+
+
 def register_features(builder, *, session, config):
     """Register project history and live-session discovery in Agent Zoo pipelines."""
     del session
+    builder.add(Feature("project_memory_settings", components=_settings(config), order=[Setting]))
     section = ProjectMemorySystemPrompt.effective_section(config)
     if not ProjectMemorySystemPrompt.enabled(section.get("enabled", True)):
         return

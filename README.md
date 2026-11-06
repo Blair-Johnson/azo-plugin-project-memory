@@ -2,6 +2,22 @@
 
 This userspace plugin provides two independently enabled features: a live-session registry view and canonical project-session history. It requires the current journal-aware `agent_zoo.session_load` API and lazy readonly buffer namespaces.
 
+## `/config` settings
+
+The Plugins page exposes three booleans: `project_memory.enabled`,
+`project_memory.project_sessions.enabled`, and `project_memory.live_sessions.enabled`.
+They show configured values and require a backend reload to take effect. Settings
+remain available when project memory or both subfeatures are internally disabled.
+Launch-config overrides take precedence and appear read-only with their effective value.
+Installer-disabled plugins are not loaded and do not appear here.
+
+Edits use the existing `AZO_PROJECT_MEMORY_CONFIG` / state-home path resolution and
+atomically replace the YAML file, preserving existing file permissions and unrelated
+YAML values, including prompts and unknown keys. YAML formatting/comments may change.
+Missing defaults are not written until edited; malformed or unreadable files are not
+overwritten. Prompts, free text, paths, and internal protocol limits are not settings.
+As with ordinary file edits, concurrent external writers are not coordinated.
+
 ## Session history
 
 `project_sessions` lists saved sessions newest-first, excluding the current session and RLMs. Catalog discovery is asynchronous and metadata-only; it does not open every session. A failed refresh retains the last good catalog and reports its status.
