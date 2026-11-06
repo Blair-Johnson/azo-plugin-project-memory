@@ -1540,7 +1540,6 @@ def _settings(config: Any) -> list[Setting]:
     def read(name):
         section = dict(_read_settings_config(ProjectMemorySystemPrompt._config_path())
                        .get(CONFIG_SECTION, {}))
-        section.update(explicit)
         return (_config_enabled(section.get(name, True)) if name == "enabled"
                 else _subfeature_enabled(section, name))
 
@@ -1552,10 +1551,10 @@ def _settings(config: Any) -> list[Setting]:
         settings.append(Setting(
             key=f"project_memory.{key}", label=label, kind="bool",
             get=lambda ctx, name=name: read(name),
-            set=None if overridden else lambda ctx, value, name=name: _write_setting(name, value),
+            set=lambda ctx, value, name=name: _write_setting(name, value),
             group="Project memory", apply="reload",
-            help=("Effective launch override; edit launch configuration to change it."
-                  if overridden else "Configured value; reload the backend to apply changes."),
+            help=("Saved default; reload the backend to apply changes."
+                  + (" A launch override takes precedence in this backend." if overridden else "")),
         ))
     return settings
 

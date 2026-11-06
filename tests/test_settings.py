@@ -120,15 +120,24 @@ def test_unreadable_and_failed_replace_are_safe(config_path, monkeypatch):
     assert set(config_path.parent.iterdir()) == {config_path}
 
 
-def test_launch_override_is_effective_and_readonly(config_path):
+def test_saved_defaults_are_editable_without_changing_launch_override(config_path):
     config_path.parent.mkdir()
     config_path.write_text("project_memory: {enabled: false, live_sessions: false}\n")
-    reg = registry({"project_memory": {"enabled": True, "live_sessions": {"other": 1}}})
+    config = {"project_memory": {"enabled": True, "live_sessions": {"other": 1}}}
+    reg = registry(config)
     rows = {row["key"]: row for row in request(reg)["settings"]}
     for key in ("project_memory.enabled", "project_memory.live_sessions.enabled"):
-        assert rows[key]["value"] is True and not rows[key]["writable"]
+        assert rows[key]["value"] is False and rows[key]["writable"]
         assert "override" in rows[key]["help"]
-        assert request(reg, key=key, value=False)["error"]["code"] == "read_only"
+        assert request(reg, key=key, value=True)["ok"]
+        assert request(reg, key=key, value=False)["ok"]
+    assert config == {"project_memory": {"enabled": True, "live_sessions": {"other": 1}}}
+    effective = pm.ProjectMemorySystemPrompt.effective_section(config)
+    assert effective["enabled"] is True
+    assert pm._subfeature_enabled(effective, "live_sessions") is True
+    reloaded = {row["key"]: row for row in request(registry())["settings"]}
+    assert reloaded["project_memory.enabled"]["value"] is False
+    assert reloaded["project_memory.live_sessions.enabled"]["value"] is False
     assert rows["project_memory.project_sessions.enabled"]["writable"]
 
 

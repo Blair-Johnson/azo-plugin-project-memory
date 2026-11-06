@@ -8,7 +8,7 @@ The Plugins page exposes three booleans: `project_memory.enabled`,
 `project_memory.project_sessions.enabled`, and `project_memory.live_sessions.enabled`.
 They show configured values and require a backend reload to take effect. Settings
 remain available when project memory or both subfeatures are internally disabled.
-Launch-config overrides take precedence and appear read-only with their effective value.
+The menu always reads and edits saved defaults. Launch-config overrides still take precedence in the running backend, but never replace or lock the defaults shown in `/config`. Changing a saved default does not change an explicit session override.
 Installer-disabled plugins are not loaded and do not appear here.
 
 Edits use the existing `AZO_PROJECT_MEMORY_CONFIG` / state-home path resolution and
