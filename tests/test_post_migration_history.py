@@ -2,10 +2,14 @@
 from types import SimpleNamespace
 
 import pytest
-from agent_utils import Session, State
-from agent_utils.files.buffer_manager import BufferManager
+from agent_utils.core.events import RenderRequested
+from agent_utils.core.session import Session
+from agent_utils.core.state import State
+from agent_utils.features.buffers import BufferManager
 from agent_zoo import pipelines
-from agent_zoo.modes import default_modes, rlm_modes
+from agent_zoo.events import SessionReady
+from agent_zoo.features.modes import default_modes, rlm_modes
+from agent_zoo.plugins import loader as plugin_loader
 
 import project_memory as pm
 
@@ -58,18 +62,19 @@ def test_current_pipeline_builds_history_only_without_memory_tools(builder, mode
     monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
     def install(builder, *, session, config, **kwargs):
         pm.register_features(builder, session=session, config=config)
-    monkeypatch.setattr(pipelines, "apply_pipeline_plugins", install)
-    with Session(system_prompt="test") as session:
-        pipeline = builder(
-            session,
-            config={"project_memory": {
-                "project_sessions": {"enabled": True},
-                "live_sessions": {"enabled": False},
-            }},
-            skill_paths=[], scheduler_type="local", max_idle=0,
-            mode_defs=modes(), initial_mode="execution", terminal_backend="headless",
-            tmux_tools_enabled=False,
-        )
+    monkeypatch.setattr(plugin_loader, "apply_pipeline_plugins", install)
+    session = Session(system_prompt="test")
+    pipeline = builder(
+        session,
+        config={"project_memory": {
+            "project_sessions": {"enabled": True},
+            "live_sessions": {"enabled": False},
+        }},
+        skill_paths=[],
+        mode_defs=modes(), initial_mode="execution", terminal_backend="headless",
+        tmux_tools_enabled=False,
+        include_llm_drivers=False,
+    )
     types = {type(component) for component in pipeline}
     assert pm.ProjectSessionBuffers in types
     assert pm.ProjectLiveSessionBuffer not in types
@@ -84,15 +89,16 @@ def test_pipeline_builds_live_registry_only(builder, modes, monkeypatch):
     monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
     def install(builder, *, session, config, **kwargs):
         pm.register_features(builder, session=session, config=config)
-    monkeypatch.setattr(pipelines, "apply_pipeline_plugins", install)
-    with Session(system_prompt="test") as session:
-        pipeline = builder(
-            session, config={"project_memory": {
-                "project_sessions": False, "live_sessions": True,
-            }}, skill_paths=[], scheduler_type="local", max_idle=0,
-            mode_defs=modes(), initial_mode="execution", terminal_backend="headless",
-            tmux_tools_enabled=False,
-        )
+    monkeypatch.setattr(plugin_loader, "apply_pipeline_plugins", install)
+    session = Session(system_prompt="test")
+    pipeline = builder(
+        session, config={"project_memory": {
+            "project_sessions": False, "live_sessions": True,
+        }}, skill_paths=[],
+        mode_defs=modes(), initial_mode="execution", terminal_backend="headless",
+        tmux_tools_enabled=False,
+        include_llm_drivers=False,
+    )
     types = {type(component) for component in pipeline}
     assert pm.ProjectLiveSessionBuffer in types
     assert pm.ProjectSessionBuffers not in types
@@ -135,7 +141,8 @@ def test_legacy_memory_config_cannot_restore_tools_or_buffer(tmp_path, monkeypat
     state.buffer_manager = BufferManager()
     state._agent_zoo_context = {"project_name": "demo", "project_dir": str(tmp_path / "project")}
     for component in components:
-        component(state)
+        event = RenderRequested() if isinstance(component, pm.ProjectMemorySystemPrompt) else SessionReady()
+        component.handle(event, state, lambda _ev: None)
     for buffer_id in ("project_sessions", "live_sessions"):
         assert state.buffer_manager.resolve_for_read(state, buffer_id).readonly
     with pytest.raises(KeyError, match="project_memory"):

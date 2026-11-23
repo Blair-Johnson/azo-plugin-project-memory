@@ -52,15 +52,18 @@ def main():
 
     # Import after isolation. No managed plugin, provider or launcher is loaded.
     import project_memory as pm
-    from agent_utils import Entry, Session
-    from agent_utils.builder import PipelineBuilder, core, buffer_editing
-    from agent_utils.checkpoint_revisions import publish_revision
-    from agent_utils.files.buffer_manager import BufferManager
-    from agent_utils.session import flatten
-    from agent_zoo import projects
-    from agent_zoo.runtime_support import SESSION_PERSISTENCE_EXCLUDED_ATTRS
-    from agent_zoo.session_load import PendingSessionLoad, load_session
-    from agent_zoo.session_store import SessionPersistence
+    from agent_utils.core.pipeline import Pipeline, PipelineBuilder
+    from agent_utils.core.session import Session
+    from agent_utils.core.state import Entry
+    from agent_utils.features.buffers import BufferManager, buffer_editing_feature
+    from agent_utils.features.core import core_feature
+    from agent_utils.storage.revisions import publish_revision
+    from agent_utils.storage.serialization import restore_session_document
+    from agent_zoo.events import SessionReady
+    from agent_zoo.storage import projects
+    from agent_zoo.storage.load import PendingSessionLoad, load_session
+    from agent_zoo.storage.serialization import SESSION_PERSISTENCE_EXCLUDED_ATTRS
+    from agent_zoo.storage.store import SessionPersistence
 
     emit("sources", root=root, plugin=pm.__file__,
          plugin_sha256=hashlib.sha256(Path(pm.__file__).read_bytes()).hexdigest())
@@ -79,24 +82,24 @@ def main():
     def plugin_session(history=True, live=True, enabled=True):
         session = Session(system_prompt="Private diagnostic; no provider calls.")
         session.state.buffer_manager = BufferManager()
-        builder = PipelineBuilder(session).add(core()).add(buffer_editing())
+        builder = PipelineBuilder().add(core_feature()).add(buffer_editing_feature())
         pm.register_features(builder, session=session, config={"project_memory": {
             "enabled": enabled,
             "project_sessions": {"enabled": history},
             "live_sessions": {"enabled": live}}})
-        session.pipeline = builder.build()
-        session._init_state()
+        session.pipeline = builder.build(suppress_warnings=True)
+        session.ensure_initialized()
         session.state._session_id = getattr(session.state, "_session_id", str(uuid.uuid4()))
         session.state._agent_zoo_context = {
             "project_name": project, "project_dir": str(project_dir),
             "local_state_root": str(local)}
-        components = {type(item): item for item in flatten(session.pipeline)}
+        components = {type(item): item for item in session.pipeline}
         return session, components
 
     def attach(session, components):
         for cls in (pm.ProjectSessionBuffers, pm.ProjectLiveSessionBuffer):
             if cls in components:
-                components[cls](session.state)
+                components[cls].handle(SessionReady(), session.state, lambda _ev: None)
 
     def read_buffer(session, name):
         # Exact buffers cache per turn; advance the observer step for retry.
@@ -134,8 +137,7 @@ def main():
         require(not isinstance(loaded, PendingSessionLoad), "exact reload stayed pending")
         require(loaded.state.commit_id == commit, "exact reload selected another commit")
         restored = Session()
-        restored.load_document(loaded.state.document)
-        restored._init_state()
+        restore_session_document(loaded.state.document, state=restored.state)
         return str([entry.messages for entry in restored.state.entries])
 
     try:
@@ -159,7 +161,7 @@ def main():
 
         for mixed in (False, True):
             sid = str(uuid.uuid4())
-            source = Session(system_prompt="Private journal history source.")
+            source = Session(pipeline=Pipeline(()), system_prompt="Private journal history source.")
             source.state._session_id = sid
             locator = project_dir / "sessions" / sid / "session.json"
             parent = None

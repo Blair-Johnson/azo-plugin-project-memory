@@ -9,9 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agent_utils import State
-from agent_utils.files.buffer_manager import BufferManager
-from agent_zoo import live_session_registry as registry, session_load
+from agent_utils.core.state import State
+from agent_utils.features.buffers import BufferManager
+from agent_zoo.events import SessionReady
+from agent_zoo.host import registry
+from agent_zoo.storage import load as session_load
 from tmux_pilot.fs_store import RecordStore
 from tmux_pilot.process_identity import ObservationState, ProcessIdentity
 
@@ -85,7 +87,7 @@ def opened(tmp_path, monkeypatch, rows=(), *, history=None):
     now = [100.0]
     component = pm.ProjectLiveSessionBuffer(history=history, clock=lambda: now[0])
     observer = state(root)
-    component(observer)
+    component.handle(SessionReady(), observer, lambda _ev: None)
     text = wait_for(lambda: (v if "Registry Read (UTC; last successful): 1970" in
                             (v := component.render(observer).text) else None))
     return component, observer, now, calls, text
@@ -228,7 +230,7 @@ def test_buffer_manager_same_step_cache_readonly_and_pickle_safe_provider(tmp_pa
     restored = pickle.loads(pickle.dumps(manager))
     observer.step += 1
     observer.buffer_manager = restored
-    component(observer)  # Rebind state after restoration, as the pipeline does.
+    component.handle(SessionReady(), observer, lambda _ev: None)  # Rebind state after restoration, as the pipeline does.
     assert restored.resolve_for_read(observer, "live_sessions").readonly
 
 

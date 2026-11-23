@@ -9,15 +9,18 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from agent_utils import Entry, Session, State
-from agent_utils.builder import PipelineBuilder, buffer_editing, core
-from agent_utils.files.buffer_manager import BufferManager
-from agent_utils.session import flatten
-from agent_utils.session_repository import StoredState
-from agent_zoo import projects, session_load
-from agent_zoo.runtime_support import SESSION_PERSISTENCE_EXCLUDED_ATTRS
-from agent_zoo.session_load import LoadedSession, PendingSessionLoad, SessionLoader
-from agent_zoo.session_store import SessionPersistence
+from agent_utils.core.pipeline import Pipeline, PipelineBuilder
+from agent_utils.core.session import Session
+from agent_utils.core.state import Entry, State, ToolCall
+from agent_utils.features.buffers import BufferManager, buffer_editing_feature
+from agent_utils.features.core import core_feature
+from agent_utils.storage.repository import StoredState
+from agent_utils.storage.serialization import restore_session_document
+from agent_zoo.events import SessionReady
+from agent_zoo.storage import load as session_load, projects
+from agent_zoo.storage.load import LoadedSession, PendingSessionLoad, SessionLoader
+from agent_zoo.storage.serialization import SESSION_PERSISTENCE_EXCLUDED_ATTRS
+from agent_zoo.storage.store import SessionPersistence
 
 import project_memory as pm
 
@@ -78,7 +81,7 @@ def opened(tmp_path, rows=None):
     catalog(root, rows if rows is not None else [row()])
     now = [100.0]
     component, observer = pm.ProjectSessionBuffers(clock=lambda: now[0]), state(root)
-    component(observer)
+    component.handle(SessionReady(), observer, lambda _ev: None)
     wait_for(lambda: "Inventory: ready" in component.render_index(observer).text)
     return component, observer, root, now
 
@@ -207,7 +210,7 @@ def test_unattached_context_is_pending_not_missing():
     observer = State(token_budget=1000)
     observer.buffer_manager = BufferManager()
     component = pm.ProjectSessionBuffers()
-    component(observer)
+    component.handle(SessionReady(), observer, lambda _ev: None)
     assert "Inventory: pending" in component.render_index(observer).text
     assert "context is not attached" in component.render_session(observer, ALIAS).text
     assert component.render_session(observer, "ses_not-valid") is None
@@ -230,7 +233,7 @@ def test_catalog_is_async_filtered_retriable_and_worker_exits_idle(tmp_path, mon
     component, observer = pm.ProjectSessionBuffers(clock=lambda: now[0]), state(root)
     try:
         started = time.monotonic()
-        component(observer)
+        component.handle(SessionReady(), observer, lambda _ev: None)
         assert time.monotonic() - started < .2 and entered.wait(1)
         assert "Inventory: pending" in component.render_index(observer).text
     finally:
@@ -343,7 +346,7 @@ def test_project_roots_isolate_identical_aliases(tmp_path, monkeypatch):
     other = tmp_path / "other-project"
     catalog(other, [row()])
     observer._agent_zoo_context["project_dir"] = str(other)
-    component(observer)
+    component.handle(SessionReady(), observer, lambda _ev: None)
     wait_for(lambda: "Inventory: ready" in component.render_index(observer).text)
     second = component.render_session(observer, ALIAS)
     assert first.path != second.path and len(component._pins) == 2
@@ -354,7 +357,7 @@ def test_real_journal_registration_readonly_and_persistence_restore(tmp_path, fu
     projects.ensure_project("demo")
     root = tmp_path / "home" / "projects" / "demo"
     local = tmp_path / "local"
-    source = Session()
+    source = Session(pipeline=Pipeline(()))
     source.state._session_id = FIRST
     source.state.entries = [Entry(index=i, step=i, messages=[dict(role=role, content=text)])
                             for i, (role, text) in enumerate((("user", "Journal question"),
@@ -370,19 +373,17 @@ def test_real_journal_registration_readonly_and_persistence_restore(tmp_path, fu
     def viewer(document=None):
         session = Session()
         session.state.buffer_manager = BufferManager()
-        builder = PipelineBuilder(session).add(core()).add(buffer_editing())
+        builder = PipelineBuilder().add(core_feature()).add(buffer_editing_feature())
         pm.register_features(builder, session=session, config={"project_memory": {
             "project_sessions": True}})
-        session.pipeline = builder.build()
+        session.pipeline = builder.build(suppress_warnings=True)
         if document is not None:
-            session.load_document(document)
-        session._init_state()
+            restore_session_document(document, session.pipeline, state=session.state)
+        session.ensure_initialized()
         session.state._session_id = CURRENT
         session.state._agent_zoo_context = dict(project_name="demo", project_dir=str(root), local_state_root=str(local))
-        component = next(c for c in flatten(session.pipeline) if isinstance(c, pm.ProjectSessionBuffers))
-        component(session.state)
-        live = next(c for c in flatten(session.pipeline) if isinstance(c, pm.ProjectLiveSessionBuffer))
-        live(session.state)
+        component = next(c for c in session.pipeline if isinstance(c, pm.ProjectSessionBuffers))
+        session.step(SessionReady())
         assert session.state.buffer_manager.resolve_for_read(session.state, "live_sessions").readonly
         wait_for(lambda: "Inventory: ready" in component.render_index(session.state).text)
         return session
@@ -498,10 +499,9 @@ def test_simultaneous_variants_share_pending_load(tmp_path, monkeypatch):
 
 
 def test_registry_navigation_to_full_saved_tool_history(tmp_path, monkeypatch):
-    from agent_utils import ToolCall
-    from agent_zoo.live_session_registry import LiveSessionRecord, LiveProcessObservation
+    from agent_zoo.host.registry import LiveProcessObservation, LiveSessionRecord
     from tmux_pilot.fs_store import RecordStore
-    from tmux_pilot.process_identity import ProcessIdentity, ObservationState
+    from tmux_pilot.process_identity import ObservationState, ProcessIdentity
 
     projects.ensure_project("demo")
     root = tmp_path / "home" / "projects" / "demo"
@@ -509,7 +509,7 @@ def test_registry_navigation_to_full_saved_tool_history(tmp_path, monkeypatch):
     paths = ["/fixtures/backend-worktrees/topic", "/fixtures/tui-worktrees/topic"]
     args = json.dumps({"command": f"git worktree add {paths[0]} topic; git worktree add {paths[1]} topic"})
     call = ToolCall("make", "terminal_run", args, json.loads(args), result="Fixture checkout prepared")
-    source = Session()
+    source = Session(pipeline=Pipeline(()))
     source.state._session_id = FIRST
     source.state.entries = [
         Entry(index=0, step=0, messages=[{"role": "user", "content": "Implement the feature"}]),
@@ -538,8 +538,8 @@ def test_registry_navigation_to_full_saved_tool_history(tmp_path, monkeypatch):
         observer._agent_zoo_context["local_state_root"] = str(local)
         history = pm.ProjectSessionBuffers()
         live = pm.ProjectLiveSessionBuffer(history=history)
-        history(observer)
-        live(observer)
+        history.handle(SessionReady(), observer, lambda _ev: None)
+        live.handle(SessionReady(), observer, lambda _ev: None)
         def read(alias):
             observer.step += 1
             return observer.buffer_manager.resolve_for_read(observer, alias)

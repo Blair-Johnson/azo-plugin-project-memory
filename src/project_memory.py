@@ -21,20 +21,24 @@ from typing import Any
 
 import yaml
 
-from agent_utils import Feature, MODEL_RENDER_CHANNEL
-from agent_utils.components import (
-    ExcludeForgotten,
-    MessageRenderer,
-    RenderTransformRegistrar,
-    ToolDispatchStart,
-)
-from agent_utils.files.buffer_manager import (
+from agent_utils.core.events import Event, RenderRequested, RunToolCall, TurnSettled
+from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.state import MODEL_RENDER_CHANNEL, State
+from agent_utils.features.buffers import (
+    BufferManager,
     ReadonlyBufferView,
     StateBoundSpecialBufferNamespaceProvider,
 )
-from agents.system_prompt import SystemPromptSkillList
-from agent_zoo.tools.special_buffers import RegisterSpecialBuffers
-from agent_zoo.runtime.settings import Setting, SettingError
+from agent_utils.features.core import (
+    ExcludeForgotten,
+    MessageRenderer,
+    RenderTransformRegistrar,
+    ToolRunner,
+)
+from agent_zoo.events import SessionReady
+from agent_zoo.features.settings import Setting, SettingError
+from agent_zoo.features.special_buffers import RegisterSpecialBuffers
+from agent_zoo.features.system_prompt import SystemPromptSkillList
 
 
 log = logging.getLogger("agent_zoo_user_plugin.project_memory")
@@ -694,6 +698,8 @@ def _bounded_history_error(error: object) -> str:
 class ProjectSessionBuffers:
     """Project-scoped immutable aliases, bounded text, and canonical pending reads."""
 
+    handles = (SessionReady, RenderRequested, TurnSettled, RunToolCall)
+    init = {"buffer_manager": BufferManager}
     reads = {"buffer_manager"}
     optional_reads = {"_agent_zoo_context", "_session_id", "_local_state_root", "run_db", "agent_db"}
     writes = {"buffer_manager"}
@@ -811,7 +817,7 @@ class ProjectSessionBuffers:
 
     @staticmethod
     def _read_catalog_snapshot(project_name: str, project_dir: Path):
-        from agent_zoo import projects
+        from agent_zoo.storage import projects
 
         catalog_path = Path(
             os.path.abspath(os.fspath(Path(project_dir) / "sessions" / "index.json"))
@@ -846,8 +852,11 @@ class ProjectSessionBuffers:
         text = str(value or "").strip()
         return text or None
 
-    def __call__(self, state):
-        manager = state.buffer_manager
+    def bind_state(self, state: State) -> State:
+        manager = getattr(state, "buffer_manager", None)
+        if not isinstance(manager, BufferManager):
+            manager = BufferManager()
+            state.buffer_manager = manager
         context = dict(getattr(state, "_agent_zoo_context", {}) or {})
         context_project_name = str(context.get("project_name") or "").strip()
         if context_project_name:
@@ -872,6 +881,10 @@ class ProjectSessionBuffers:
         if project_dir is not None:
             self._request_inventory(project_name, project_dir, current_session_id)
         return state
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        del event, emit
+        self.bind_state(state)
 
     def _runtime_context(self, state) -> tuple[str, Path | None, str]:
         context = dict(getattr(state, "_agent_zoo_context", {}) or {})
@@ -987,7 +1000,7 @@ class ProjectSessionBuffers:
 
     def _observe(self, scope, pin, request, timeout_s, *, project=True,
                  full=False) -> ReadonlyBufferView | None:
-        from agent_zoo.session_load import PendingSessionLoad, load_session
+        from agent_zoo.storage.load import PendingSessionLoad, load_session
 
         alias = scope[1] + ("_full" if full else "")
         text_scope = scope[0], alias
@@ -1139,6 +1152,8 @@ class ProjectSessionBuffers:
 class ProjectLiveSessionBuffer:
     """Observational, project-scoped instance discovery; no session control."""
 
+    handles = (SessionReady, RenderRequested, TurnSettled, RunToolCall)
+    init = {"buffer_manager": BufferManager}
     reads = {"buffer_manager"}
     optional_reads = {"_agent_zoo_context", "_session_id", "agent_db", "run_db"}
     writes = {"buffer_manager", "_project_live_sessions_render"}
@@ -1157,12 +1172,20 @@ class ProjectLiveSessionBuffer:
         self._worker = None
         self._snapshots = {}
 
-    def __call__(self, state):
+    def bind_state(self, state: State) -> State:
+        manager = getattr(state, "buffer_manager", None)
+        if not isinstance(manager, BufferManager):
+            manager = BufferManager()
+            state.buffer_manager = manager
         setattr(state, self.RENDER_ATTR, functools.partial(self.render, state))
         _register_exact_special_buffer(
-            state.buffer_manager, self.BUFFER_ID, operator.methodcaller(self.RENDER_ATTR)
+            manager, self.BUFFER_ID, operator.methodcaller(self.RENDER_ATTR)
         )
         return state
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        del event, emit
+        self.bind_state(state)
 
     @staticmethod
     def _context(state):
@@ -1217,7 +1240,7 @@ class ProjectLiveSessionBuffer:
     def _read_registry(root):
         # Older hosts must not disable unrelated plugin features.
         try:
-            from agent_zoo import live_session_registry as registry
+            from agent_zoo.host import registry
         except ImportError:
             return "unsupported", (), "typed live-registry API is unavailable"
         reader = getattr(registry, "list_live_sessions", None)
@@ -1387,21 +1410,26 @@ class ProjectLiveSessionBuffer:
 class ProjectMemorySystemPrompt(RenderTransformRegistrar):
     """Register configured project-memory guidance on the model channel."""
 
+    handles = (RenderRequested,)
     reads = {"entries"}
     transform_name = "project memory system prompt"
 
     def __init__(self, text: str) -> None:
         self.text = str(text or "").strip()
 
-    def __call__(self, state):
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        assert isinstance(event, RenderRequested)
+        del emit
+        if event.channels is not None and MODEL_RENDER_CHANNEL not in event.channels:
+            return
         if not self.text or not state.entries:
-            return state
+            return
         entry = state.entries[0]
         if self.transform_name in entry.render_transform_names(
             MODEL_RENDER_CHANNEL,
             pending=True,
         ):
-            return state
+            return
         block = "# Project Memory\n" + self.text
 
         def transform(messages, _state, _block=block):
@@ -1419,7 +1447,6 @@ class ProjectMemorySystemPrompt(RenderTransformRegistrar):
             transform,
             name=self.transform_name,
         )
-        return state
 
     @staticmethod
     def _append_content(content: Any, block: str) -> Any:
@@ -1594,7 +1621,7 @@ def register_features(builder, *, session, config):
     components.append(ProjectMemorySystemPrompt(prompt))
     order.extend(
         [
-            ToolDispatchStart,
+            ToolRunner,
             SystemPromptSkillList,
             ProjectMemorySystemPrompt,
             ExcludeForgotten,

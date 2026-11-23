@@ -2,8 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
-from agent_utils import PipelineBuilder, Session
-from agent_zoo.runtime.settings import Setting, SettingError, SettingsContext, SettingsRegistry
+from agent_utils.core.pipeline import PipelineBuilder
+from agent_utils.core.state import State
+from agent_zoo.features.settings import Setting, SettingError, SettingsContext, SettingsRegistry
 
 import project_memory as pm
 
@@ -18,10 +19,9 @@ def config_path(tmp_path, monkeypatch):
 def registry(config=None):
     features = []
     pm.register_features(SimpleNamespace(add=features.append), session=None, config=config or {})
-    with Session() as session:
-        builder = PipelineBuilder(session)
-        builder.add(next(feature for feature in features if feature.name == "project_memory_settings"))
-        pipeline = builder.build(suppress_warnings=True)
+    builder = PipelineBuilder()
+    builder.add(next(feature for feature in features if feature.name == "project_memory_settings"))
+    pipeline = builder.build(suppress_warnings=True)
     return SettingsRegistry([component for component in pipeline if isinstance(component, Setting)])
 
 
@@ -29,8 +29,10 @@ def request(reg, **kwargs):
     action = "set" if kwargs else "list"
     if kwargs:
         kwargs["binding"] = reg.binding
-    return reg.handle({"type": "plugin_settings", "request_id": "test", "action": action, **kwargs},
-                      SettingsContext(SimpleNamespace(state=SimpleNamespace())))
+    return reg.handle(
+        {"type": "plugin_settings", "request_id": "test", "action": action, **kwargs},
+        SettingsContext(state=State(), emit=lambda _ev: None),
+    )
 
 
 def test_defaults_metadata_and_typed_persistence(config_path):

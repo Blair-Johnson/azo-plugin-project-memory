@@ -3,10 +3,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from agent_utils import Entry, Session, State
+from agent_utils.core.events import RenderRequested
+from agent_utils.core.session import Session
+from agent_utils.core.state import Entry, State
 from agent_zoo import pipelines
-from agent_zoo.modes import default_modes, rlm_modes
-from agent_zoo.runtime.settings import Setting, SettingsContext, SettingsRegistry
+from agent_zoo.features.modes import default_modes, rlm_modes
+from agent_zoo.features.settings import Setting, SettingsContext, SettingsRegistry
+from agent_zoo.plugins import loader as plugin_loader
 
 import project_memory as pm
 
@@ -20,8 +23,8 @@ def test_system_prompt_render_transform_is_idempotent_and_model_only():
     target = state.entries[0]
     target.initialize_pending_render_channels(("model", "user"))
 
-    component(state)
-    component(state)
+    component.handle(RenderRequested(), state, lambda _ev: None)
+    component.handle(RenderRequested(), state, lambda _ev: None)
     assert target.render_transform_names(pending=True) == (
         "project memory system prompt",
     )
@@ -76,31 +79,33 @@ def _install_only_project_memory(builder, *, session, config, **_kwargs):
 )
 def test_real_harness_pipelines_build_with_project_memory(builder, modes, monkeypatch, tmp_path):
     monkeypatch.setenv(pm.CONFIG_PATH_ENV, str(tmp_path / "settings.yaml"))
-    monkeypatch.setattr(pipelines, "apply_pipeline_plugins", _install_only_project_memory)
+    monkeypatch.setattr(plugin_loader, "apply_pipeline_plugins", _install_only_project_memory)
     monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
 
-    with Session(system_prompt="test") as session:
-        pipeline = builder(
-            session,
-            config={"project_memory": {"system_prompt": "Consult session history."}},
-            skill_paths=[],
-            scheduler_type="local",
-            max_idle=0,
-            mode_defs=modes(),
-            initial_mode="execution",
-            terminal_backend="headless",
-            tmux_tools_enabled=False,
-        )
+    session = Session(system_prompt="test")
+    pipeline = builder(
+        session,
+        config={"project_memory": {"system_prompt": "Consult session history."}},
+        skill_paths=[],
+        mode_defs=modes(),
+        initial_mode="execution",
+        terminal_backend="headless",
+        tmux_tools_enabled=False,
+        include_llm_drivers=False,
+    )
 
     types = {type(component) for component in pipeline}
     assert pm.ProjectSessionBuffers in types
     assert pm.ProjectLiveSessionBuffer in types
     assert pm.ProjectMemorySystemPrompt in types
     registry = SettingsRegistry([component for component in pipeline if isinstance(component, Setting)])
-    catalog = registry.handle({"type": "plugin_settings", "request_id": "test", "action": "list"},
-                              SettingsContext(session))
+    catalog = registry.handle(
+        {"type": "plugin_settings", "request_id": "test", "action": "list"},
+        SettingsContext(state=session.state, emit=lambda _ev: None),
+    )
     assert catalog["ok"] and catalog["error"] is None
-    assert len(catalog["settings"]) == 3
+    pm_settings = [row for row in catalog["settings"] if row["key"].startswith("project_memory.")]
+    assert len(pm_settings) == 3
     assert all(row["error"] is None for row in catalog["settings"])
 
     def position(kind):
@@ -108,7 +113,7 @@ def test_real_harness_pipelines_build_with_project_memory(builder, modes, monkey
 
     assert position(pm.RegisterSpecialBuffers) < position(pm.ProjectSessionBuffers)
     assert position(pm.ProjectSessionBuffers) < position(pm.ProjectLiveSessionBuffer)
-    assert position(pm.ProjectLiveSessionBuffer) < position(pm.ToolDispatchStart)
+    assert position(pm.ProjectLiveSessionBuffer) < position(pm.ToolRunner)
     tool_names = {getattr(component, "name", None) for component in pipeline}
     assert tool_names.isdisjoint({
         "record_memory", "update_memory", "suppress_memory", "delete_memory",
