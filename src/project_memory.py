@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import operator
 import os
 import queue
@@ -21,7 +22,14 @@ from typing import Any
 
 import yaml
 
-from agent_utils.core.events import Event, RenderRequested, RunToolCall, TurnSettled
+from agent_utils.core.events import (
+    Event,
+    IoCompleted,
+    IoFailed,
+    RenderRequested,
+    RunToolCall,
+    TurnSettled,
+)
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import MODEL_RENDER_CHANNEL, State
 from agent_utils.features.buffers import (
@@ -31,11 +39,18 @@ from agent_utils.features.buffers import (
 )
 from agent_utils.features.core import (
     ExcludeForgotten,
+    IoFence,
     MessageRenderer,
     RenderTransformRegistrar,
     ToolRunner,
 )
-from agent_zoo.events import SessionReady
+from agent_zoo.drivers.sessions import sanitize_ws_url
+from agent_zoo.events import (
+    DiscoverSessions,
+    DiscoverSessionsResult,
+    LiveSessionInfo,
+    SessionReady,
+)
 from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.special_buffers import RegisterSpecialBuffers
 from agent_zoo.features.system_prompt import SystemPromptSkillList
@@ -1149,28 +1164,31 @@ class ProjectSessionBuffers:
             "Transcript load requested. Please try again shortly.")
 
 
-class ProjectLiveSessionBuffer:
-    """Observational, project-scoped instance discovery; no session control."""
+_LIVE_TERMINAL_STATUSES = frozenset({"stopped", "exited", "failed", "cancelled", "completed"})
+_LIVE_HEALTH_FRESHNESS_S = 15.0
 
-    handles = (SessionReady, RenderRequested, TurnSettled, RunToolCall)
+
+class ProjectLiveSessionBuffer:
+    """Observational, project-scoped instance discovery via ``AgentZooSessionDriver``."""
+
+    handles = (SessionReady, RenderRequested, TurnSettled, RunToolCall, IoCompleted, IoFailed)
     init = {"buffer_manager": BufferManager}
     reads = {"buffer_manager"}
-    optional_reads = {"_agent_zoo_context", "_session_id", "agent_db", "run_db"}
+    optional_reads = {"_agent_zoo_context", "_session_id", "_local_state_root", "agent_db", "run_db"}
     writes = {"buffer_manager", "_project_live_sessions_render"}
     BUFFER_ID = "live_sessions"
     RENDER_ATTR = "_project_live_sessions_render"
+    IO_TAG = "project_memory_live_sessions"
     REFRESH_S = 5.0
-    WORKER_IDLE_S = 0.2
-    QUEUE_LIMIT = 8
+    MAX_IN_FLIGHT = 8
     ROW_LIMIT = 1000
 
-    def __init__(self, *, history=None, clock=time.time):
+    def __init__(self, *, history=None, clock=None):
         self.history = history
-        self.clock = clock
-        self._lock = threading.RLock()
-        self._work = queue.Queue(maxsize=self.QUEUE_LIMIT)
-        self._worker = None
-        self._snapshots = {}
+        self._explicit_clock = clock is not None
+        self.clock = time.time if clock is None else clock
+        self._snapshots: dict[tuple[str, str], dict[str, Any]] = {}
+        self._pending_ops: dict[str, tuple[str, str]] = {}
 
     def bind_state(self, state: State) -> State:
         manager = getattr(state, "buffer_manager", None)
@@ -1183,14 +1201,39 @@ class ProjectLiveSessionBuffer:
         )
         return state
 
+    def _throttle_ts(self, event: Event) -> float:
+        ts = float(getattr(event, "ts", 0.0) or 0.0)
+        if ts > 0.0:
+            return ts
+        if self._explicit_clock:
+            return float(self.clock())
+        return ts
+
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
-        del event, emit
+        del emit
+        if isinstance(event, IoCompleted):
+            self._handle_completed(event)
+            return
+        if isinstance(event, IoFailed):
+            self._handle_failed(event)
+            return
         self.bind_state(state)
+        self._maybe_request_discovery(state, self._throttle_ts(event))
 
     @staticmethod
     def _context(state):
         value = getattr(state, "_agent_zoo_context", {})
         return value if isinstance(value, Mapping) else {}
+
+    @classmethod
+    def _local_state_root(cls, state) -> str:
+        context = cls._context(state)
+        value = (
+            context.get("local_state_root")
+            or getattr(state, "_local_state_root", "")
+            or getattr(state, "local_state_root", "")
+        )
+        return str(value or "").strip()
 
     @classmethod
     def _store_root(cls, state):
@@ -1218,92 +1261,98 @@ class ProjectLiveSessionBuffer:
         return Path(os.path.normpath(os.fspath(root))), ""
 
     @staticmethod
-    def _endpoint(value):
-        from urllib.parse import urlsplit, urlunsplit
+    def _new_snapshot() -> dict[str, Any]:
+        return dict(status="pending", rows=(), error="", pending=False,
+                    op_id=None, snapshot_at=None, attempt_at=None, retry_at=None)
 
-        raw = str(value or "")
-        try:
-            parsed = urlsplit(raw)
-            if (parsed.scheme not in {"ws", "wss"} or not parsed.hostname
-                    or any(ord(c) < 32 or ord(c) == 127 for c in raw)):
-                return "(unavailable: malformed advertised endpoint)"
-            _ = parsed.port
-            authority = parsed.netloc.rsplit("@", 1)[-1]
-            sanitized = parsed.netloc != authority or bool(parsed.query or parsed.fragment)
-            if sanitized:
-                return urlunsplit((parsed.scheme, authority, parsed.path, "", "")) + " [sanitized]"
-            return raw
-        except (ValueError, TypeError):
-            return "(unavailable: malformed advertised endpoint)"
+    def _maybe_request_discovery(self, state: State, throttle_ts: float) -> None:
+        context = self._context(state)
+        project = str(context.get("project_name") or "(unknown)")
+        root, _ = self._store_root(state)
+        if root is None:
+            return
+        key = (project, os.fspath(root))
+        snapshot = self._snapshots.setdefault(key, self._new_snapshot())
+        io = getattr(state, "io", None)
+        if io is None or not callable(getattr(io, "submit", None)):
+            snapshot.update(status="unsupported", error="runtime session discovery IO is unavailable")
+            return
+        is_active = getattr(io, "is_active", None)
+        if callable(is_active):
+            for op_id, op_key in list(self._pending_ops.items()):
+                if not is_active(op_id):
+                    self._pending_ops.pop(op_id, None)
+                    snap = self._snapshots.get(op_key)
+                    if snap is not None and snap.get("op_id") == op_id:
+                        snap.update(pending=False, op_id=None)
+        if snapshot["pending"] or (snapshot["retry_at"] is not None and throttle_ts < snapshot["retry_at"]):
+            return
+        if len(self._pending_ops) >= self.MAX_IN_FLIGHT:
+            snapshot.update(status="busy", error="bounded discovery request limit reached")
+            return
+        op_id = io.submit(
+            DiscoverSessions(
+                store_root=os.fspath(root),
+                local_state_root=self._local_state_root(state),
+                include_stale=True,
+                probe_local_processes=False,
+            ),
+            tag=self.IO_TAG,
+        )
+        self._pending_ops[op_id] = key
+        snapshot.update(pending=True, op_id=op_id, attempt_at=self.clock())
+
+    def _handle_completed(self, event: IoCompleted) -> None:
+        key = self._pending_ops.pop(event.op_id, None)
+        if key is None:
+            return
+        snapshot = self._snapshots.setdefault(key, self._new_snapshot())
+        retry_at = self._throttle_ts(event) + self.REFRESH_S
+        result = event.value
+        if not isinstance(result, DiscoverSessionsResult):
+            snapshot.update(status="unavailable", error="invalid discovery result",
+                            pending=False, op_id=None, retry_at=retry_at)
+            return
+        rows = tuple(result.rows or ())
+        if not all(isinstance(row, LiveSessionInfo) for row in rows):
+            snapshot.update(status="unavailable", error="registry returned untyped records",
+                            pending=False, op_id=None, retry_at=retry_at)
+            return
+        status = str(result.status or "ready")
+        error = _one_line_text(result.error, "") if result.error else ""
+        snapshot.update(status=status, error=error, pending=False, op_id=None, retry_at=retry_at)
+        if status == "ready":
+            observed = (float(result.observed_at)
+                        if result.observed_at and result.observed_at > 0 else float(self.clock()))
+            snapshot.update(rows=rows, snapshot_at=observed, error="")
+
+    def _handle_failed(self, event: IoFailed) -> None:
+        key = self._pending_ops.pop(event.op_id, None)
+        if key is None:
+            return
+        snapshot = self._snapshots.setdefault(key, self._new_snapshot())
+        # Exception messages can contain arbitrary persisted values or URLs.
+        error = (type(event.error).__name__ if isinstance(event.error, BaseException)
+                 else "TimeoutError" if event.timed_out else "discovery failed")
+        snapshot.update(status="unavailable", error=error, pending=False, op_id=None,
+                        retry_at=self._throttle_ts(event) + self.REFRESH_S)
 
     @staticmethod
-    def _read_registry(root):
-        # Older hosts must not disable unrelated plugin features.
-        try:
-            from agent_zoo.host import registry
-        except ImportError:
-            return "unsupported", (), "typed live-registry API is unavailable"
-        reader = getattr(registry, "list_live_sessions", None)
-        record_type = getattr(registry, "LiveSessionRecord", None)
-        if not callable(reader) or record_type is None or not all(
-            callable(getattr(record_type, name, None))
-            for name in ("process_state", "is_terminal", "is_confirmed_stopped")
-        ):
-            return "unsupported", (), "typed live-registry health API is unavailable"
-        try:
-            root.stat()
-        except FileNotFoundError:
-            return "absent", (), "coordination store does not exist; nothing was created"
-        rows = tuple(reader(root, include_stale=True))
-        if not all(isinstance(row, record_type) for row in rows):
-            raise ValueError("registry returned untyped records")
-        return "ready", rows, ""
-
-    def _request(self, project, root):
-        key = (project, os.fspath(root))
-        now = self.clock()
-        with self._lock:
-            snapshot = self._snapshots.setdefault(key, dict(
-                status="pending", rows=(), error="", pending=False,
-                snapshot_at=None, attempt_at=None, retry_at=0.0,
-            ))
-            if not snapshot["pending"] and now >= snapshot["retry_at"]:
-                try:
-                    self._work.put_nowait((key, root))
-                except queue.Full:
-                    snapshot.update(status="busy", error="bounded registry refresh queue is full")
-                else:
-                    snapshot.update(pending=True, attempt_at=now)
-                    if self._worker is None:
-                        self._worker = threading.Thread(
-                            target=self._run, name="project-memory-live-registry", daemon=True
-                        )
-                        self._worker.start()
-            return dict(snapshot)
-
-    def _run(self):
-        while True:
-            try:
-                key, root = self._work.get(timeout=self.WORKER_IDLE_S)
-            except queue.Empty:
-                with self._lock:
-                    if self._work.empty():
-                        self._worker = None
-                        return
-                continue
-            try:
-                status, rows, error = self._read_registry(root)
-            except Exception as exc:
-                # Exception messages can contain arbitrary persisted values or URLs.
-                status, rows, error = "unavailable", (), type(exc).__name__
-            completed_at = self.clock()
-            with self._lock:
-                snapshot = self._snapshots[key]
-                snapshot.update(status=status, error=error, pending=False,
-                                retry_at=completed_at + self.REFRESH_S)
-                if status == "ready":
-                    snapshot.update(rows=rows, snapshot_at=completed_at)
-            self._work.task_done()
+    def _row_health(row: LiveSessionInfo, *, now: float) -> tuple[str, bool, bool]:
+        """Return ``(health, is_terminal, is_confirmed_stopped)`` evaluated at ``now``."""
+        if row.is_terminal or str(row.status or "").lower() in _LIVE_TERMINAL_STATUSES:
+            return "unknown", True, bool(row.is_confirmed_stopped)
+        has_obs = bool(row.observation_reason) or row.observed_at > 0.0
+        if (row.process_identity is None or not has_obs
+                or not math.isfinite(now) or not math.isfinite(row.observed_at)):
+            return "unknown", False, False
+        age = now - row.observed_at
+        if row.observed_at < 0 or age < 0:
+            return "unknown", False, False
+        pstate = str(row.process_state or "unknown").lower()
+        if pstate == "dead" or row.is_confirmed_stopped:
+            return "dead", False, True
+        return ("alive" if pstate == "alive" and age <= _LIVE_HEALTH_FRESHNESS_S else "unknown"), False, False
 
     def render(self, state):
         context = self._context(state)
@@ -1323,11 +1372,11 @@ class ProjectLiveSessionBuffer:
             lines.append(f"Registry: {context_error}.")
             return ReadonlyBufferView(id=self.BUFFER_ID, path="project-memory://live-sessions",
                                       text="\n".join(lines) + "\n")
-        snapshot = self._request(project, root)
+        snapshot = self._snapshots.get((project, os.fspath(root))) or self._new_snapshot()
         status = snapshot["status"]
         has_snapshot = snapshot["snapshot_at"] is not None
         lines.append(f"Coordination Store: {root}")
-        if snapshot["pending"]:
+        if snapshot["pending"] or (status == "pending" and not has_snapshot):
             lines.append("Registry: refresh pending; last-good snapshot retained (stale)." if has_snapshot
                          else "Registry: pending; initial background read has not completed.")
         elif status == "ready":
@@ -1348,12 +1397,13 @@ class ProjectLiveSessionBuffer:
         active = []
         terminal = stopped = 0
         for row in snapshot["rows"]:
-            if row.is_terminal():
+            health, is_terminal, is_stopped = self._row_health(row, now=now)
+            if is_terminal:
                 terminal += 1
-            elif row.is_confirmed_stopped(now=now):
+            elif is_stopped:
                 stopped += 1
             else:
-                active.append((row, row.process_state(now=now).value))
+                active.append((row, health))
         active.sort(key=lambda item: (item[0].session_id, item[0].instance_id))
         alive = sum(health == "alive" for _, health in active)
         lines.extend([
@@ -1382,8 +1432,12 @@ class ProjectLiveSessionBuffer:
             lines.append("History: disabled; no transcript links registered.")
         current = str(getattr(state, "_session_id", "") or context.get("session_id") or "")
         for row, health in shown:
-            observation = row.process_observation
-            age = f"{now - observation.observed_at:.1f}s" if observation is not None else "(unknown)"
+            has_obs = bool(row.observation_reason) or row.observed_at > 0.0
+            age = f"{now - row.observed_at:.1f}s" if has_obs else "(unknown)"
+            endpoint = _one_line_text(
+                sanitize_ws_url(row.websocket_url),
+                "(unavailable: malformed advertised endpoint)",
+            )
             lines.extend([
                 "", f"## Instance: {_one_line_text(row.instance_id, '(unknown)')}",
                 f"Session ID: {_one_line_text(row.session_id, '(unknown)')}",
@@ -1394,10 +1448,10 @@ class ProjectLiveSessionBuffer:
                 f"Child/RLM: {'yes' if row.kind.lower().startswith('rlm') else 'not indicated'}",
                 f"Hostname: {_one_line_text(row.hostname, '(unknown)')}; PID: {row.pid}",
                 f"Lifecycle status: {_one_line_text(row.status, '(unknown)')}; process state: {health}",
-                f"Observation (UTC): {_format_utc(observation.observed_at if observation else None)}; age: {age}",
-                f"Observation reason: {_one_line_text(observation.reason if observation else '', '(not recorded)')}",
+                f"Observation (UTC): {_format_utc(row.observed_at if has_obs else None)}; age: {age}",
+                f"Observation reason: {_one_line_text(row.observation_reason, '(not recorded)')}",
                 f"Metadata Updated (UTC): {_format_utc(row.updated_at)}",
-                f"Websocket endpoint: {self._endpoint(row.websocket_url)}",
+                f"Websocket endpoint: {endpoint}",
             ])
             if self.history is not None:
                 alias = aliases.get(row.session_id)
@@ -1609,7 +1663,7 @@ def register_features(builder, *, session, config):
     prompt = str(section.get("system_prompt", default_prompt) or "").strip()
 
     components = []
-    order = [RegisterSpecialBuffers]
+    order = [IoFence, RegisterSpecialBuffers]
     history = ProjectSessionBuffers() if sessions_enabled else None
     if history is not None:
         components.append(history)

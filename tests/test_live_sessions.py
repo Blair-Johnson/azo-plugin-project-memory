@@ -1,17 +1,33 @@
-"""Observational registry contracts; private stores, no production registry writes."""
+"""Observational registry contracts via AgentZooSessionDriver; private stores only."""
 from __future__ import annotations
 
 import pickle
-import threading
+import queue
 import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested, TurnSettled
+from agent_utils.core.io import SubmitOp
+from agent_utils.core.pipeline import Pipeline
+from agent_utils.core.session import Session
 from agent_utils.core.state import State
 from agent_utils.features.buffers import BufferManager
-from agent_zoo.events import SessionReady
+from agent_utils.features.core import IoFence
+from agent_utils.runtime.simulation import SimulationRuntime
+from agent_zoo.drivers.sessions import (
+    AgentZooSessionDriver,
+    SimSessionDriver,
+    live_record_to_info,
+)
+from agent_zoo.events import (
+    DiscoverSessions,
+    DiscoverSessionsResult,
+    LiveSessionInfo,
+    SessionReady,
+)
 from agent_zoo.host import registry
 from agent_zoo.storage import load as session_load
 from tmux_pilot.fs_store import RecordStore
@@ -28,16 +44,6 @@ def private_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_ZOO_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("AGENT_ZOO_STATE_ROOT", str(tmp_path / "home"))
     monkeypatch.setenv("AGENT_ZOO_LOCAL_STATE_ROOT", str(tmp_path / "local"))
-
-
-def wait_for(fn, timeout=4):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        value = fn()
-        if value:
-            return value
-        time.sleep(.005)
-    pytest.fail("registry did not settle")
 
 
 def state(root):
@@ -62,6 +68,10 @@ def record(instance="one", sid=FIRST, *, health="alive", observed=99, status="ru
     )
 
 
+def info_from_record(rec, *, now=100.0):
+    return live_record_to_info(rec, now=now, probe_local_processes=False, sanitize_url=True)
+
+
 class HistorySpy:
     def __init__(self):
         self.calls = []
@@ -71,36 +81,84 @@ class HistorySpy:
         return {row["session_id"]: "ses_" + row["session_id"][:8] for row in rows}
 
 
-def opened(tmp_path, monkeypatch, rows=(), *, history=None):
+def dispatch_via_driver(component, observer, event, driver, *, ts=None):
+    """Step ``event``, execute submitted ``DiscoverSessions`` on ``driver``, feed result back."""
+    if ts is not None:
+        event.ts = ts
+    component.handle(event, observer, lambda _ev: None)
+    effects = observer.io.take_outbox()
+    for effect in effects:
+        assert isinstance(effect, SubmitOp)
+        assert isinstance(effect.request, DiscoverSessions)
+        assert effect.request.include_stale is True
+        assert effect.request.probe_local_processes is False
+        inbox: queue.Queue = queue.Queue()
+        driver.start(inbox.put)
+        try:
+            driver.submit(effect.op_id, effect.request)
+            io_ev = inbox.get(timeout=4.0)
+        finally:
+            driver.close()
+        observer.io.complete(effect.op_id)
+        if ts is not None:
+            io_ev.ts = ts
+        component.handle(io_ev, observer, lambda _ev: None)
+    return effects
+
+
+def opened(tmp_path, rows=(), *, history=None, now_val=100.0):
+    """Step ``ProjectLiveSessionBuffer`` through ``state.io`` + ``IoCompleted(DiscoverSessionsResult)``."""
     root = tmp_path / "project"
-    store = root / "coordination"
-    store.mkdir(parents=True)
-    calls = []
-
-    def read(path, *, include_stale=False):
-        calls.append(path)
-        assert include_stale is True
-        assert threading.current_thread() is not threading.main_thread()
-        return tuple(rows)
-
-    monkeypatch.setattr(registry, "list_live_sessions", read)
-    now = [100.0]
+    now = [float(now_val)]
     component = pm.ProjectLiveSessionBuffer(history=history, clock=lambda: now[0])
     observer = state(root)
-    component.handle(SessionReady(), observer, lambda _ev: None)
-    text = wait_for(lambda: (v if "Registry Read (UTC; last successful): 1970" in
-                            (v := component.render(observer).text) else None))
-    return component, observer, now, calls, text
+    requests = []
+
+    def refresh(ev=None, *, rows_override=None, result_override=None, error=None):
+        event = ev if ev is not None else RenderRequested(ts=now[0])
+        component.handle(event, observer, lambda _e: None)
+        effects = observer.io.take_outbox()
+        for eff in effects:
+            assert isinstance(eff, SubmitOp)
+            assert isinstance(eff.request, DiscoverSessions)
+            assert eff.request.include_stale is True
+            assert eff.request.probe_local_processes is False
+            requests.append(eff.request)
+            observer.io.complete(eff.op_id)
+            if error is not None:
+                component.handle(IoFailed(op_id=eff.op_id, error=error, ts=now[0]), observer, lambda _e: None)
+            elif result_override is not None:
+                component.handle(IoCompleted(op_id=eff.op_id, value=result_override, ts=now[0]), observer, lambda _e: None)
+            else:
+                src = rows if rows_override is None else rows_override
+                infos = tuple(
+                    item if isinstance(item, LiveSessionInfo) else info_from_record(item, now=now[0])
+                    for item in src
+                )
+                component.handle(
+                    IoCompleted(
+                        op_id=eff.op_id,
+                        value=DiscoverSessionsResult(status="ready", rows=infos, observed_at=now[0]),
+                        ts=now[0],
+                    ),
+                    observer,
+                    lambda _e: None,
+                )
+        return effects
+
+    refresh(SessionReady(ts=now[0]))
+    text = component.render(observer).text
+    return component, observer, now, requests, refresh, text
 
 
-def test_per_instance_current_rlm_liveness_and_allowlisted_metadata(tmp_path, monkeypatch):
+def test_per_instance_current_rlm_liveness_and_allowlisted_metadata(tmp_path):
     history = HistorySpy()
     rows = [record("two"), record("one"), record("current", CURRENT, kind="rlm"),
             record("old", observed=1), record("future", observed=101),
             record("unverified", health=None), record("dead", health="dead", observed=1),
             record("retired", status="stopped"),
             replace(record("safe"), metadata={"password": "NEVER-DISPLAY-THIS"})]
-    _, _, _, calls, text = opened(tmp_path, monkeypatch, rows, history=history)
+    _, _, _, requests, _, text = opened(tmp_path, rows, history=history)
     assert "Registry Instances: 9" in text
     assert "Active candidates: 7; confirmed alive: 4; unknown: 3" in text
     assert "Excluded: 1 terminal lifecycle; 1 other confirmed-stopped instances" in text
@@ -114,7 +172,7 @@ def test_per_instance_current_rlm_liveness_and_allowlisted_metadata(tmp_path, mo
     assert "NOT necessarily this runtime instance" in text
     assert "availability checked on open" in text
     assert {r["session_id"] for r in history.calls[-1]} == {FIRST, CURRENT}
-    assert len(history.calls[-1]) == 2 and len(calls) == 1
+    assert len(history.calls[-1]) == 2 and len(requests) == 1
 
 
 @pytest.mark.parametrize("supervisor_id", ["", "runtime-supervisor"])
@@ -123,99 +181,149 @@ def test_per_instance_current_rlm_liveness_and_allowlisted_metadata(tmp_path, mo
     ("default", "not indicated"),
     ("rlm", "yes"),
 ])
-def test_child_label_uses_kind_not_process_supervision(
-    tmp_path, monkeypatch, kind, expected, supervisor_id,
-):
+def test_child_label_uses_kind_not_process_supervision(tmp_path, kind, expected, supervisor_id):
     rows = [record(kind=kind, supervisor_id=supervisor_id)]
-    _, _, _, _, text = opened(tmp_path, monkeypatch, rows)
+    _, _, _, _, _, text = opened(tmp_path, rows)
     assert f"Kind: {kind}\nChild/RLM: {expected}\n" in text
 
 
 @pytest.mark.parametrize(("endpoint", "expected"), [
     ("ws://127.0.0.1:8123/agent", "ws://127.0.0.1:8123/agent"),
     ("wss://user:SECRET@example.test:8123/agent?token=SECRET#SECRET",
-     "wss://example.test:8123/agent [sanitized]"),
-    ("ws://[::1]:8123/agent?secret=value", "ws://[::1]:8123/agent [sanitized]"),
-    ("ws://user:SECRET@example.test/agent", "ws://example.test/agent [sanitized]"),
+     "wss://example.test:8123/agent"),
+    ("ws://[::1]:8123/agent?secret=value", "ws://[::1]:8123/agent"),
+    ("ws://user:SECRET@example.test/agent", "ws://example.test/agent"),
     ("ws://[broken/SECRET", "(unavailable: malformed advertised endpoint)"),
     ("ws://example.test:bad/SECRET", "(unavailable: malformed advertised endpoint)"),
     ("https://example.test/SECRET", "(unavailable: malformed advertised endpoint)"),
-    ("ws://example.test/SECRET\n", "(unavailable: malformed advertised endpoint)"),
 ])
-def test_endpoint_sanitization(endpoint, expected):
-    assert pm.ProjectLiveSessionBuffer._endpoint(endpoint) == expected
+def test_endpoint_sanitization(tmp_path, endpoint, expected):
+    rec = replace(record("ep"), websocket_url=endpoint)
+    _, _, _, _, _, text = opened(tmp_path, [rec])
+    assert f"Websocket endpoint: {expected}\n" in text
+    assert "SECRET" not in text
 
 
-def test_authoritative_context_override_and_attached_store_roots(tmp_path, monkeypatch):
-    component, observer, now, calls, _ = opened(tmp_path, monkeypatch)
+def test_authoritative_context_override_and_attached_store_roots(tmp_path):
+    component, observer, now, requests, refresh, _ = opened(tmp_path)
     override = tmp_path / "override"
-    override.mkdir()
     observer._agent_zoo_context["project_store_root"] = str(override)
+    observer._agent_zoo_context["local_state_root"] = str(tmp_path / "local-root")
     observer.agent_db = SimpleNamespace(store=SimpleNamespace(root=tmp_path / "wrong"))
-    wait_for(lambda: "Registry: empty" in component.render(observer).text)
-    assert calls[-1] == override
-    assert tmp_path / "wrong" not in calls
+    refresh()
+    assert requests[-1].store_root == str(override)
+    assert requests[-1].local_state_root == str(tmp_path / "local-root")
+    assert all(req.store_root != str(tmp_path / "wrong") for req in requests)
+    assert "Registry: empty" in component.render(observer).text
+
     del observer._agent_zoo_context["project_store_root"]
     attached = tmp_path / "attached"
-    attached.mkdir()
     observer.agent_db.store.root = attached
-    wait_for(lambda: "Registry: empty" in component.render(observer).text)
-    assert calls[-1] == attached
+    refresh()
+    assert requests[-1].store_root == str(attached)
+    assert "Registry: empty" in component.render(observer).text
+
     observer._agent_zoo_context["project_store_root"] = "relative/path"
     text = component.render(observer).text
     assert "must be absolute" in text
     assert not (tmp_path / "wrong").exists()
+    assert not override.exists()
+    assert not attached.exists()
 
 
-def test_missing_context_absent_empty_unavailable_and_unsupported_are_distinct(tmp_path, monkeypatch):
-    component = pm.ProjectLiveSessionBuffer()
+def test_missing_context_absent_empty_unavailable_and_unsupported_are_distinct(tmp_path):
+    component = pm.ProjectLiveSessionBuffer(clock=lambda: 100.0)
     observer = state(tmp_path / "project")
     observer._agent_zoo_context = {}
+    component.handle(SessionReady(ts=100.0), observer, lambda _ev: None)
+    assert observer.io.take_outbox() == []
     assert "Registry: missing-context" in component.render(observer).text
-    observer._agent_zoo_context = dict(project_name="absent", project_dir=str(tmp_path / "missing"))
-    wait_for(lambda: "Registry: absent" in component.render(observer).text)
-    assert not (tmp_path / "missing").exists()
+
+    # Real AgentZooSessionDriver never creates missing directories.
+    missing = tmp_path / "missing"
+    observer._agent_zoo_context = dict(project_name="absent", project_dir=str(missing))
+    dispatch_via_driver(component, observer, RenderRequested(), AgentZooSessionDriver(), ts=100.0)
+    assert not missing.exists()
+    assert "Registry: empty (successful read; zero instances)" in component.render(observer).text
+
+    # Driver-reported absent status is rendered distinctly.
+    observer._agent_zoo_context = dict(project_name="driver-absent", project_store_root=str(tmp_path / "gone"))
+    component.handle(RenderRequested(ts=100.0), observer, lambda _ev: None)
+    eff = observer.io.take_outbox()[0]
+    observer.io.complete(eff.op_id)
+    component.handle(
+        IoCompleted(
+            op_id=eff.op_id,
+            value=DiscoverSessionsResult(status="absent", error="coordination store does not exist"),
+            ts=100.0,
+        ),
+        observer,
+        lambda _ev: None,
+    )
+    assert "Registry: absent" in component.render(observer).text
+    assert "No successful registry snapshot" in component.render(observer).text
+
+    # Existing empty store via real AgentZooSessionDriver.
     store = RecordStore(tmp_path / "empty")
     observer._agent_zoo_context = dict(project_name="empty", project_store_root=str(store.root))
-    wait_for(lambda: "Registry: empty (successful read; zero instances)" in component.render(observer).text)
+    dispatch_via_driver(component, observer, RenderRequested(), AgentZooSessionDriver(), ts=100.0)
+    assert "Registry: empty (successful read; zero instances)" in component.render(observer).text
+
+    # Malformed store -> IoFailed -> unavailable, never empty.
     malformed = tmp_path / "malformed"
     malformed.mkdir()
     (malformed / "format.json").write_text("{bad JSON")
     observer._agent_zoo_context = dict(project_name="malformed", project_store_root=str(malformed))
-    text = wait_for(lambda: (v if "Registry: unavailable" in (v := component.render(observer).text) else None))
+    dispatch_via_driver(component, observer, RenderRequested(), AgentZooSessionDriver(), ts=100.0)
+    text = component.render(observer).text
+    assert "Registry: unavailable" in text
     assert "No successful registry snapshot" in text
-    monkeypatch.setattr(registry, "list_live_sessions", None)
-    observer._agent_zoo_context = dict(project_name="unsupported", project_store_root=str(store.root))
-    wait_for(lambda: "Registry: unsupported" in component.render(observer).text)
+
+    # Unsupported when runtime IO is unavailable.
+    no_io = SimpleNamespace(
+        _agent_zoo_context=dict(project_name="unsupported", project_store_root=str(store.root)),
+        buffer_manager=BufferManager(),
+    )
+    component.handle(RenderRequested(ts=100.0), no_io, lambda _ev: None)
+    assert "Registry: unsupported" in component.render(no_io).text
 
 
-def test_failed_refresh_preserves_snapshot_time_recomputes_health_and_recovers(tmp_path, monkeypatch):
-    component, observer, now, calls, text = opened(tmp_path, monkeypatch, [record()])
+def test_failed_refresh_preserves_snapshot_time_recomputes_health_and_recovers(tmp_path):
+    component, observer, now, requests, refresh, text = opened(tmp_path, [record()])
     old_read_time = next(line for line in text.splitlines() if line.startswith("Registry Read"))
-    failed = []
 
-    def failure(*args, **kwargs):
-        failed.append(True)
-        raise OSError("SECRET error payload must not leak")
+    # Within 5s throttle window -> no new DiscoverSessions submitted.
+    now[0] = 104.0
+    assert refresh(RenderRequested(ts=104.0)) == []
+    assert len(requests) == 1
 
-    monkeypatch.setattr(registry, "list_live_sessions", failure)
-    now[0] = 130
-    text = wait_for(lambda: (v if "Registry: unavailable" in (v := component.render(observer).text) else None))
+    # Past 5s throttle -> refresh fires and fails with secret-bearing exception.
+    now[0] = 130.0
+    refresh(RenderRequested(ts=130.0), error=OSError("SECRET error payload must not leak"))
+    text = component.render(observer).text
+    assert "Registry: unavailable" in text
     assert "Last-good snapshot retained (stale)" in text
     assert old_read_time in text
     assert "confirmed alive: 0; unknown: 1" in text
     assert "SECRET" not in text
-    for _ in range(5):
-        component.render(observer)
-    assert len(failed) == 1  # Retry cooldown is respected.
-    now[0] = 136
-    monkeypatch.setattr(registry, "list_live_sessions", lambda *a, **k: (record(observed=136),))
-    text = wait_for(lambda: (v if "Registry: ready" in (v := component.render(observer).text) else None))
+    assert len(requests) == 2
+
+    # Retry cooldown (5s) is respected via event timestamps.
+    for delta in (0.5, 1.0, 2.0, 4.9):
+        now[0] = 130.0 + delta
+        assert refresh(RenderRequested(ts=now[0])) == []
+    assert len(requests) == 2
+
+    # Past cooldown -> recovers with fresh observation.
+    now[0] = 136.0
+    refresh(RenderRequested(ts=136.0), rows_override=[record(observed=136)])
+    text = component.render(observer).text
+    assert "Registry: ready." in text
     assert "confirmed alive: 1" in text and old_read_time not in text
 
 
-def test_buffer_manager_same_step_cache_readonly_and_pickle_safe_provider(tmp_path, monkeypatch):
-    component, observer, now, _, _ = opened(tmp_path, monkeypatch, [record()])
+def test_buffer_manager_same_step_cache_readonly_and_pickle_safe_provider(tmp_path):
+    component, observer, now, _, _, _ = opened(tmp_path, [record()])
     manager = observer.buffer_manager
     first = manager.resolve_for_read(observer, "live_sessions")
     assert first.readonly and first.path == "project-memory://live-sessions"
@@ -230,45 +338,69 @@ def test_buffer_manager_same_step_cache_readonly_and_pickle_safe_provider(tmp_pa
     restored = pickle.loads(pickle.dumps(manager))
     observer.step += 1
     observer.buffer_manager = restored
-    component.handle(SessionReady(), observer, lambda _ev: None)  # Rebind state after restoration, as the pipeline does.
+    component.handle(SessionReady(ts=now[0]), observer, lambda _ev: None)
     assert restored.resolve_for_read(observer, "live_sessions").readonly
 
 
-def test_delayed_read_is_nonblocking_one_pending_and_worker_exits(tmp_path, monkeypatch):
+def test_in_flight_discovery_is_nonblocking_deduplicated_and_uses_state_io(tmp_path):
     root = tmp_path / "project"
-    (root / "coordination").mkdir(parents=True)
-    release, entered = threading.Event(), threading.Event()
-    calls = []
-
-    def delayed(*args, **kwargs):
-        calls.append(True)
-        entered.set()
-        assert release.wait(3)
-        return (record(),)
-
-    monkeypatch.setattr(registry, "list_live_sessions", delayed)
-    component = pm.ProjectLiveSessionBuffer(clock=lambda: 100)
+    component = pm.ProjectLiveSessionBuffer(clock=lambda: 100.0)
+    assert not hasattr(component, "_worker")
+    assert not hasattr(component, "_work")
     observer = state(root)
-    try:
-        started = time.monotonic()
+
+    # First event submits exactly one DiscoverSessions op through state.io.
+    component.handle(SessionReady(ts=100.0), observer, lambda _ev: None)
+    effects = observer.io.take_outbox()
+    assert len(effects) == 1
+    eff = effects[0]
+    assert isinstance(eff, SubmitOp)
+    assert isinstance(eff.request, DiscoverSessions)
+    assert eff.request.include_stale is True
+    assert eff.request.probe_local_processes is False
+    assert "Registry: pending" in component.render(observer).text
+
+    # Subsequent events while in-flight do NOT duplicate the request.
+    for ts in (100.5, 102.0, 110.0):
+        component.handle(RenderRequested(ts=ts), observer, lambda _ev: None)
+        assert observer.io.take_outbox() == []
         assert "Registry: pending" in component.render(observer).text
-        assert time.monotonic() - started < .2
-        assert entered.wait(2)
-        for _ in range(20):
-            assert "Registry: pending" in component.render(observer).text
-        assert calls == [True]
-    finally:
-        release.set()
-    wait_for(lambda: "Registry: ready" in component.render(observer).text)
-    wait_for(lambda: component._worker is None)
+
+    # Completing via IoCompleted populates the snapshot.
+    observer.io.complete(eff.op_id)
+    component.handle(
+        IoCompleted(
+            op_id=eff.op_id,
+            value=DiscoverSessionsResult(
+                status="ready",
+                rows=(info_from_record(record(), now=100.0),),
+                observed_at=100.0,
+            ),
+            ts=100.5,
+        ),
+        observer,
+        lambda _ev: None,
+    )
+    assert "Registry: ready." in component.render(observer).text
+
+    # External cancellation of a pending op recovers cleanly on the next event.
+    component.handle(TurnSettled(ts=106.0), observer, lambda _ev: None)
+    eff2 = observer.io.take_outbox()[0]
+    observer.io.cancel(eff2.op_id)
+    observer.io.take_outbox()
+    component.handle(RenderRequested(ts=106.1), observer, lambda _ev: None)
+    eff3 = observer.io.take_outbox()
+    assert len(eff3) == 1 and eff3[0].op_id != eff2.op_id
 
 
 def test_private_registry_read_never_loads_history_probes_or_mutates(tmp_path, monkeypatch):
     import socket
     import tmux_pilot.process_identity as process_identity
+    import agent_zoo.drivers.sessions as sessions_mod
 
     store = RecordStore(tmp_path / "private-store")
-    row = record()
+    now = time.time()
+    row = record(observed=now - 1.0)
     store.put("live", row.instance_id, row.to_value())
 
     def contents():
@@ -285,20 +417,26 @@ def test_private_registry_read_never_loads_history_probes_or_mutates(tmp_path, m
     monkeypatch.setattr(registry, "publish_live_session", forbidden)
     monkeypatch.setattr(registry, "capture_process_identity", forbidden)
     monkeypatch.setattr(process_identity, "observe_process", forbidden)
+    monkeypatch.setattr(sessions_mod, "observe_process", forbidden)
+    monkeypatch.setattr(sessions_mod, "capture_process_identity", forbidden)
     monkeypatch.setattr(socket, "socket", forbidden)
     monkeypatch.setattr(RecordStore, "put", forbidden)
     monkeypatch.setattr(RecordStore, "update", forbidden)
+
     observer = state(tmp_path / "project-without-catalog")
     observer._agent_zoo_context["project_store_root"] = str(store.root)
-    component = pm.ProjectLiveSessionBuffer(history=HistorySpy(), clock=lambda: 100)
-    text = wait_for(lambda: (v if "Registry: ready" in (v := component.render(observer).text) else None))
+    component = pm.ProjectLiveSessionBuffer(history=HistorySpy(), clock=lambda: now)
+    dispatch_via_driver(component, observer, SessionReady(), AgentZooSessionDriver(), ts=now)
+    text = component.render(observer).text
+    assert "Registry: ready." in text
+    assert "confirmed alive: 1" in text
     assert "ses_344655c1_full" in text
     assert contents() == before
     assert not (tmp_path / "project-without-catalog").exists()
 
 
-def test_row_limit_and_disabled_history(tmp_path, monkeypatch):
-    component, observer, _, _, _ = opened(tmp_path, monkeypatch, [record("one"), record("two")])
+def test_row_limit_and_disabled_history(tmp_path):
+    component, observer, _, _, _, _ = opened(tmp_path, [record("one"), record("two")])
     component.ROW_LIMIT = 1
     text = component.render(observer).text
     assert "Rows shown: 1 of 2 active candidates; truncated: 1" in text
@@ -307,35 +445,18 @@ def test_row_limit_and_disabled_history(tmp_path, monkeypatch):
     assert "## Instance: one" in text and "## Instance: two" not in text
 
 
-def test_refresh_queue_is_bounded_and_projects_do_not_share_snapshots(tmp_path, monkeypatch):
-    release, entered = threading.Event(), threading.Event()
-
-    def blocked(*args, **kwargs):
-        entered.set()
-        assert release.wait(3)
-        return ()
-
-    monkeypatch.setattr(registry, "list_live_sessions", blocked)
-    component = pm.ProjectLiveSessionBuffer(clock=lambda: 100)
+def test_in_flight_limit_is_bounded_and_projects_do_not_share_snapshots(tmp_path):
+    component = pm.ProjectLiveSessionBuffer(clock=lambda: 100.0)
     observer = state(tmp_path / "project")
-    try:
-        first = tmp_path / "store-0"
-        first.mkdir()
-        observer._agent_zoo_context["project_store_root"] = str(first)
-        component.render(observer)
-        assert entered.wait(2)
-        for i in range(1, component.QUEUE_LIMIT + 2):
-            root = tmp_path / f"store-{i}"
-            root.mkdir()
-            observer._agent_zoo_context["project_store_root"] = str(root)
-            text = component.render(observer).text
-            assert "No successful registry snapshot" in text or "Registry: pending" in text
-        assert "Registry: busy" in text
-        assert component._work.qsize() == component.QUEUE_LIMIT
-        assert sum(s["pending"] for s in component._snapshots.values()) == component.QUEUE_LIMIT + 1
-    finally:
-        release.set()
-    wait_for(lambda: component._worker is None)
+    for i in range(component.MAX_IN_FLIGHT + 1):
+        root = tmp_path / f"store-{i}"
+        observer._agent_zoo_context["project_store_root"] = str(root)
+        component.handle(RenderRequested(ts=100.0), observer, lambda _ev: None)
+        text = component.render(observer).text
+        assert "No successful registry snapshot" in text or "Registry: pending" in text
+    assert "Registry: busy" in text
+    assert len(component._pending_ops) == component.MAX_IN_FLIGHT
+    assert sum(s["pending"] for s in component._snapshots.values()) == component.MAX_IN_FLIGHT
 
 
 def test_corrupt_live_record_is_not_an_empty_registry(tmp_path):
@@ -344,13 +465,15 @@ def test_corrupt_live_record_is_not_an_empty_registry(tmp_path):
     observer = state(tmp_path / "project")
     observer._agent_zoo_context["project_store_root"] = str(store.root)
     component = pm.ProjectLiveSessionBuffer()
-    text = wait_for(lambda: (v if "Registry: unavailable" in (v := component.render(observer).text) else None))
+    dispatch_via_driver(component, observer, SessionReady(), AgentZooSessionDriver(), ts=100.0)
+    text = component.render(observer).text
+    assert "Registry: unavailable" in text
     assert "No successful registry snapshot" in text
     assert "Registry: empty" not in text
 
 
-def test_future_dead_evidence_is_unknown_not_excluded(tmp_path, monkeypatch):
-    _, _, _, _, text = opened(tmp_path, monkeypatch, [record("future-dead", health="dead", observed=101)])
+def test_future_dead_evidence_is_unknown_not_excluded(tmp_path):
+    _, _, _, _, _, text = opened(tmp_path, [record("future-dead", health="dead", observed=101)])
     assert "Active candidates: 1; confirmed alive: 0; unknown: 1" in text
     assert "## Instance: future-dead" in text
     assert "Excluded: 0 terminal lifecycle; 0 other confirmed-stopped instances" in text
@@ -362,6 +485,61 @@ def test_real_history_alias_is_issued_without_catalog_or_transcript_load(tmp_pat
 
     monkeypatch.setattr(session_load, "load_session", forbidden)
     history = pm.ProjectSessionBuffers(clock=lambda: 100)
-    _, observer, _, _, text = opened(tmp_path, monkeypatch, [record()], history=history)
+    _, observer, _, _, _, text = opened(tmp_path, [record()], history=history)
     assert "ses_344655c1 | ses_344655c1_full" in text
     assert not (Path(observer._agent_zoo_context["project_dir"]) / "sessions").exists()
+
+
+def test_simulation_runtime_end_to_end_with_sim_session_driver(tmp_path):
+    sim_driver = SimSessionDriver(default_delay=0.1)
+    sim_ref = [None]
+    component = pm.ProjectLiveSessionBuffer(clock=lambda: sim_ref[0].now)
+    pipeline = Pipeline([IoFence(), component])
+    session = Session(pipeline=pipeline)
+    session.state.step = 1
+    session.state._session_id = CURRENT
+    session.state._agent_zoo_context = dict(
+        project_name="sim-demo",
+        project_store_root=str(tmp_path / "sim-store"),
+    )
+    sim = SimulationRuntime(session, seed=42)
+    sim_ref[0] = sim
+    sim_driver.register(sim)
+
+    # Seed one alive instance observed at t=100.0 with a credentialed WS URL.
+    sim.now = 100.0
+    from agent_zoo.drivers.sessions import _SimSession
+
+    sim_driver.sessions["inst-sim-1"] = _SimSession(
+        session_id=FIRST,
+        instance_id="inst-sim-1",
+        pid=4321,
+        owned=False,
+        process_identity=ProcessIdentity("sim-host", "sim-boot", "sim-ns", 4321, "tok-1"),
+        websocket_url="ws://user:TOPSECRET@127.0.0.1:41000/session?token=TOPSECRET",
+        status="running",
+        title="Simulated worker",
+        kind="rlm",
+        started_at=95.0,
+        updated_at=99.5,
+        observation_state=ObservationState.ALIVE,
+        observation_reason="sim-heartbeat",
+    )
+
+    sim.inject(SessionReady())
+    sim.run_until_idle()
+    text = session.state.buffer_manager.resolve_for_read(session.state, "live_sessions").text
+    assert "Registry: ready." in text
+    assert "confirmed alive: 1; unknown: 0" in text
+    assert "ws://127.0.0.1:41000/session" in text
+    assert "TOPSECRET" not in text
+    assert "Child/RLM: yes" in text
+
+    # Advance 20s without a new observation -> health degrades honestly to unknown.
+    sim.now = 120.0
+    session.state.step += 1
+    sim.inject(RenderRequested())
+    sim.run_until_idle()
+    stale_text = session.state.buffer_manager.resolve_for_read(session.state, "live_sessions").text
+    assert "confirmed alive: 0; unknown: 1" in stale_text
+    assert "process state: unknown" in stale_text

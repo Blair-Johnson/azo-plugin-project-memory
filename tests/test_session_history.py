@@ -540,10 +540,24 @@ def test_registry_navigation_to_full_saved_tool_history(tmp_path, monkeypatch):
         live = pm.ProjectLiveSessionBuffer(history=history)
         history.handle(SessionReady(), observer, lambda _ev: None)
         live.handle(SessionReady(), observer, lambda _ev: None)
+        from queue import Queue
+        from agent_zoo.drivers.sessions import AgentZooSessionDriver
+        driver = AgentZooSessionDriver()
+        inbox: Queue = Queue()
+        driver.start(inbox.put)
+        try:
+            for effect in observer.io.take_outbox():
+                driver.submit(effect.op_id, effect.request)
+                io_ev = inbox.get(timeout=4.0)
+                observer.io.complete(effect.op_id)
+                live.handle(io_ev, observer, lambda _ev: None)
+        finally:
+            driver.close()
         def read(alias):
             observer.step += 1
             return observer.buffer_manager.resolve_for_read(observer, alias)
-        text = wait_for(lambda: (v.text if "Saved history:" in (v := read("live_sessions")).text else None))
+        text = read("live_sessions").text
+        assert "Saved history:" in text
         assert f"{ALIAS} | {ALIAS}_full" in text
         compact = wait_for(lambda: (v if "Source Commit:" in (v := read(ALIAS)).text else None))
         full = wait_for(lambda: (v if "Source Commit:" in (v := read(ALIAS + "_full")).text else None))
