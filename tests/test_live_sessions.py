@@ -396,7 +396,8 @@ def test_in_flight_discovery_is_nonblocking_deduplicated_and_uses_state_io(tmp_p
 def test_private_registry_read_never_loads_history_probes_or_mutates(tmp_path, monkeypatch):
     import socket
     import tmux_pilot.process_identity as process_identity
-    import agent_zoo.drivers.sessions as sessions_mod
+    import agent_zoo.drivers.sessions.inspection as sessions_inspection
+    import agent_zoo.drivers.sessions.live as sessions_live
 
     store = RecordStore(tmp_path / "private-store")
     now = time.time()
@@ -417,8 +418,10 @@ def test_private_registry_read_never_loads_history_probes_or_mutates(tmp_path, m
     monkeypatch.setattr(registry, "publish_live_session", forbidden)
     monkeypatch.setattr(registry, "capture_process_identity", forbidden)
     monkeypatch.setattr(process_identity, "observe_process", forbidden)
-    monkeypatch.setattr(sessions_mod, "observe_process", forbidden)
-    monkeypatch.setattr(sessions_mod, "capture_process_identity", forbidden)
+    monkeypatch.setattr(sessions_live, "observe_process", forbidden)
+    monkeypatch.setattr(sessions_live, "capture_process_identity", forbidden)
+    monkeypatch.setattr(sessions_inspection, "observe_process", forbidden)
+    monkeypatch.setattr(sessions_inspection, "capture_process_identity", forbidden)
     monkeypatch.setattr(socket, "socket", forbidden)
     monkeypatch.setattr(RecordStore, "put", forbidden)
     monkeypatch.setattr(RecordStore, "update", forbidden)
@@ -508,7 +511,7 @@ def test_simulation_runtime_end_to_end_with_sim_session_driver(tmp_path):
 
     # Seed one alive instance observed at t=100.0 with a credentialed WS URL.
     sim.now = 100.0
-    from agent_zoo.drivers.sessions import _SimSession
+    from agent_zoo.drivers.sessions.sim import _SimSession
 
     sim_driver.sessions["inst-sim-1"] = _SimSession(
         session_id=FIRST,
