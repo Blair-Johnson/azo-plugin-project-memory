@@ -36,9 +36,9 @@ from agent_utils.features.buffers import (
     ReadonlyBufferView,
 )
 from agent_utils.features.core import (
-    ExcludeForgotten,
     IoFence,
     MessageRenderer,
+    RenderPlanFinalizer,
     RenderTransformRegistrar,
     ToolRunner,
 )
@@ -2231,7 +2231,7 @@ def register_features(builder, *, config):
             ToolRunner,
             SystemPromptSkillList,
             ProjectMemorySystemPrompt,
-            ExcludeForgotten,
+            RenderPlanFinalizer,
             MessageRenderer,
         ]
     )
