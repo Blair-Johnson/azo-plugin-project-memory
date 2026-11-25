@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import math
@@ -44,9 +43,11 @@ from agent_utils.features.core import (
 )
 from agent_zoo.drivers.sessions import sanitize_ws_url
 from agent_zoo.durability import (
+    PluginConfigBox,
+    PluginConfigStore,
     PluginStorage,
-    StoreUpdate,
     ThreadPoolDriver,
+    read_session_index_file,
     session_context,
     session_state,
 )
@@ -792,33 +793,12 @@ class ProjectHistoryDriver(ThreadPoolDriver):
         self._clock = clock
         self._load_wait_timeout_s = max(0.05, float(load_wait_timeout_s))
 
-    def quiesce(
-        self,
-        *,
-        policy: str = "terminate",
-        deadline: float | None = None,
-    ) -> list[Event]:
-        return super().quiesce(
-            policy=policy,
-            deadline=time.monotonic() if deadline is None else deadline,
-        )
-
     @staticmethod
     def _read_catalog_snapshot(project_name: str, project_dir: Path):
-        from agent_zoo.storage import projects
-
         catalog_path = Path(
             os.path.abspath(os.fspath(Path(project_dir) / "sessions" / "index.json"))
         )
-        data = projects._read_observational_json(catalog_path)
-        if data is projects._MISSING_DOCUMENT:
-            return projects.SessionIndexSnapshot(project_name, catalog_path, [], "absent")
-        return projects.SessionIndexSnapshot(
-            project_name,
-            catalog_path,
-            projects._validate_session_index(data, catalog_path),
-            "present",
-        )
+        return read_session_index_file(catalog_path, project=project_name)
 
     def execute_op(self, op_id: OpId, req: IoRequest) -> Any:
         if isinstance(req, LoadProjectCatalogRequest):
@@ -2084,35 +2064,45 @@ def _subfeature_enabled(section: Mapping[str, Any], name: str) -> bool:
     return _config_enabled(value)
 
 
-class _SettingsBox:
-    """Pure in-memory container for project-memory settings loaded once at build time."""
+def _validate_settings_document(document: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(document, dict) or not isinstance(document.get(CONFIG_SECTION, {}), dict):
+        raise ValueError("Project-memory settings must contain YAML mappings")
+    return dict(document)
 
-    def __init__(
-        self,
-        document: dict[str, Any],
-        *,
-        load_error: str | None = None,
-    ) -> None:
-        self.document: dict[str, Any] = copy.deepcopy(document)
-        self.load_error: str | None = load_error
 
-    def get_value(self, name: str) -> bool:
-        if self.load_error is not None:
-            raise SettingError(self.load_error)
-        section = dict(self.document.get(CONFIG_SECTION, {}))
-        return (
-            _config_enabled(section.get(name, True))
-            if name == "enabled"
-            else _subfeature_enabled(section, name)
-        )
+def _load_settings_box() -> PluginConfigBox:
+    """Build-time YAML loader returning a ``PluginConfigBox``."""
+    path = ProjectMemorySystemPrompt._config_path()
+    box = PluginConfigBox(
+        PLUGIN_NAME,
+        config_filename=CONFIG_REL_PATH,
+        store=PluginConfigStore(path),
+        validate=_validate_settings_document,
+    )
+    if box.load_error is None and path.is_file():
+        try:
+            if not path.read_text(encoding="utf-8").strip():
+                box.load_error = "Project-memory settings must contain YAML mappings"
+        except (OSError, UnicodeError):
+            box.load_error = "Cannot read project-memory settings"
+    return box
 
-    def set_value(self, name: str, value: Any, ctx: Any) -> None:
-        if type(value) is not bool:
-            raise SettingError("Project-memory settings require a boolean")
-        if self.load_error is not None:
-            raise SettingError(self.load_error)
-        previous = copy.deepcopy(self.document)
-        section = dict(self.document.get(CONFIG_SECTION, {}))
+
+def _get_setting_value(box: PluginConfigBox, name: str) -> bool:
+    section = dict(box.require_loaded().get(CONFIG_SECTION, {}))
+    return (
+        _config_enabled(section.get(name, True))
+        if name == "enabled"
+        else _subfeature_enabled(section, name)
+    )
+
+
+def _set_setting_value(box: PluginConfigBox, name: str, value: Any, ctx: Any) -> None:
+    if type(value) is not bool:
+        raise SettingError("Project-memory settings require a boolean")
+
+    def _update(doc: dict[str, Any]) -> dict[str, Any]:
+        section = dict(doc.get(CONFIG_SECTION, {}))
         if name == "enabled":
             section[name] = value
         else:
@@ -2122,43 +2112,10 @@ class _SettingsBox:
             section[name] = (
                 {**existing, "enabled": value} if isinstance(existing, dict) else value
             )
-        self.document[CONFIG_SECTION] = section
-        updated = copy.deepcopy(self.document)
+        doc[CONFIG_SECTION] = section
+        return doc
 
-        def _rollback() -> None:
-            self.document = previous
-
-        if ctx is not None and callable(getattr(ctx, "submit_persist_io", None)):
-            ctx.submit_persist_io(
-                StoreUpdate(
-                    plugin=PLUGIN_NAME,
-                    scope="config",
-                    config_filename=CONFIG_REL_PATH,
-                    value=updated,
-                ),
-                rollback=_rollback,
-            )
-
-
-def _load_settings_box() -> _SettingsBox:
-    """Build-time YAML loader populating an in-memory ``_SettingsBox``."""
-    path = ProjectMemorySystemPrompt._config_path()
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return _SettingsBox({})
-    except (OSError, UnicodeError):
-        return _SettingsBox({}, load_error="Cannot read project-memory settings")
-    try:
-        document = yaml.safe_load(raw)
-    except yaml.YAMLError:
-        return _SettingsBox({}, load_error="Cannot read project-memory settings")
-    if not isinstance(document, dict) or not isinstance(document.get(CONFIG_SECTION, {}), dict):
-        return _SettingsBox(
-            {},
-            load_error="Project-memory settings must contain YAML mappings",
-        )
-    return _SettingsBox(document)
+    box.mutate(ctx, _update)
 
 
 def _settings(config: Any) -> list[Setting]:
@@ -2179,8 +2136,10 @@ def _settings(config: Any) -> list[Setting]:
                 key=f"project_memory.{key}",
                 label=label,
                 kind="bool",
-                get=lambda ctx, _box=box, name=name: _box.get_value(name),
-                set=lambda ctx, value, _box=box, name=name: _box.set_value(name, value, ctx),
+                get=lambda ctx, _box=box, name=name: _get_setting_value(_box, name),
+                set=lambda ctx, value, _box=box, name=name: _set_setting_value(
+                    _box, name, value, ctx
+                ),
                 group="Project memory",
                 apply="reload",
                 help=(
