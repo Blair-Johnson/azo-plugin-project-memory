@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-import functools
+import copy
 import json
 import logging
 import math
-import operator
 import os
-import queue
 import re
-import stat
-import tempfile
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,16 +24,18 @@ from agent_utils.core.events import (
     Event,
     IoCompleted,
     IoFailed,
+    IoInterrupted,
     RenderRequested,
     RunToolCall,
+    SessionRestored,
     TurnSettled,
 )
+from agent_utils.core.io import IoRequest, OpId
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import MODEL_RENDER_CHANNEL, State
 from agent_utils.features.buffers import (
     BufferManager,
     ReadonlyBufferView,
-    StateBoundSpecialBufferNamespaceProvider,
 )
 from agent_utils.features.core import (
     ExcludeForgotten,
@@ -44,7 +44,10 @@ from agent_utils.features.core import (
     RenderTransformRegistrar,
     ToolRunner,
 )
+from agent_utils.runtime.driver import Driver
+from agent_zoo.core.feature_state import session_state
 from agent_zoo.drivers.sessions import sanitize_ws_url
+from agent_zoo.durability import PluginStorage, StoreUpdate
 from agent_zoo.events import (
     DiscoverSessions,
     DiscoverSessionsResult,
@@ -54,6 +57,7 @@ from agent_zoo.events import (
 from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.special_buffers import RegisterSpecialBuffers
 from agent_zoo.features.system_prompt import SystemPromptSkillList
+from agent_zoo.storage.projects import resolve_state_root
 
 
 log = logging.getLogger("agent_zoo_user_plugin.project_memory")
@@ -62,11 +66,10 @@ PLUGIN_NAME = "azo-plugin-project-memory"
 CONFIG_SECTION = "project_memory"
 CONFIG_PATH_ENV = "AZO_PROJECT_MEMORY_CONFIG"
 CONFIG_FILENAME = "project_memory.yaml"
+CONFIG_REL_PATH = f"config/{CONFIG_FILENAME}"
 PROJECT_SESSIONS_BUFFER_ID = "project_sessions"
 SESSION_BUFFER_PREFIX = "ses_"
 MIN_SESSION_PREFIX_LENGTH = 8
-PROJECT_SESSION_RENDER_ATTR = "_project_session_memory_render"
-PROJECT_SESSION_INDEX_RENDER_ATTR = "_project_session_memory_index_render"
 SESSION_SYSTEM_PROMPT = (
     "When a request appears to depend on work from an earlier project session and the "
     "necessary context is not already available, view project_sessions. It indexes prior "
@@ -710,125 +713,161 @@ def _bounded_history_error(error: object) -> str:
     return text or "unknown history read failure"
 
 
-class ProjectSessionBuffers:
-    """Project-scoped immutable aliases, bounded text, and canonical pending reads."""
+# ---------------------------------------------------------------------------
+# Pure Sans-I/O IoRequests, Results, Runtime State & ProjectHistoryDriver
+# ---------------------------------------------------------------------------
 
-    handles = (SessionReady, RenderRequested, TurnSettled, RunToolCall)
-    init = {"buffer_manager": BufferManager}
-    reads = {"buffer_manager"}
-    optional_reads = {"_agent_zoo_context", "_session_id", "_local_state_root", "run_db", "agent_db"}
-    writes = {"buffer_manager"}
 
-    def __init__(self, *, clock=time.time) -> None:
-        self.clock = clock
-        self._project_name = self._session_id = ""
-        self._lock = threading.RLock()
-        self._work = queue.Queue(maxsize=SESSION_LOAD_QUEUE_LIMIT)
-        self._worker: threading.Thread | None = None
-        self._inventories: dict[str, dict[str, Any]] = {}
-        self._pins: dict[tuple[str, str], dict[str, Any]] = {}
-        self._requests: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
-        self._texts: OrderedDict[tuple[str, str], tuple[str, int]] = OrderedDict()
-        self._text_bytes = 0
+@dataclass
+class LoadProjectCatalogRequest(IoRequest):
+    """Read a project's observational session index snapshot off-loop."""
 
-    def bind_session(self, session_id: str, *, project_name: str | None = None,
-                     db: Any | None = None) -> None:
-        self._session_id = str(session_id or "")
-        if project_name is not None:
-            self._project_name = str(project_name or "default")
+    project_name: str
+    project_dir: str
+    current_session_id: str = ""
 
-    @staticmethod
-    def _project_key(project_name: str, project_dir: Path) -> str:
-        return f"{project_name}\x00{os.path.abspath(os.fspath(project_dir))}"
 
-    def _issue_aliases(self, key: str, sessions) -> dict[str, str]:
-        # Index-issued aliases survive removal and prefix collisions, even before
-        # their first document read. There is only one metadata record per alias.
+@dataclass(frozen=True)
+class ProjectCatalogResult:
+    """Driver response for ``LoadProjectCatalogRequest``."""
+
+    project_name: str
+    project_dir: str
+    status: str  # "ready" | "absent" | "unavailable"
+    sessions: tuple[dict[str, Any], ...] = ()
+    error: str = ""
+
+
+@dataclass
+class LoadProjectSessionRequest(IoRequest):
+    """Load and project a single saved session transcript off-loop."""
+
+    project_name: str
+    project_dir: str
+    alias: str  # base alias without "_full"
+    full: bool = False
+    session: dict[str, Any] = field(default_factory=dict)
+    commit_id: str | None = None
+    instance_id: str = ""
+    source_format: str = ""
+    generated_at: float = 0.0
+    receipt: str = ""
+    local_state_root: str | None = None
+
+
+@dataclass(frozen=True)
+class ProjectSessionResult:
+    """Driver response for ``LoadProjectSessionRequest``."""
+
+    project_name: str
+    project_dir: str
+    alias: str
+    full: bool
+    commit_id: str
+    instance_id: str
+    source_format: str
+    generated_at: float
+    receipt: str
+    text: str
+
+
+class ProjectHistoryDriver(Driver):
+    """Ephemeral IO driver executing project catalog & saved-session projection reads."""
+
+    durability = "ephemeral"
+    request_types = (LoadProjectCatalogRequest, LoadProjectSessionRequest)
+
+    def __init__(
+        self,
+        *,
+        max_workers: int = 4,
+        clock: Callable[[], float] = time.time,
+        load_wait_timeout_s: float = 10.0,
+    ) -> None:
+        super().__init__()
+        self._max_workers = max(1, int(max_workers))
+        self._clock = clock
+        self._load_wait_timeout_s = max(0.05, float(load_wait_timeout_s))
+        self._lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: dict[OpId, Future[Any]] = {}
+        self._in_flight: dict[OpId, IoRequest] = {}
+        self._cancelled: set[OpId] = set()
+        self._closed = False
+
+    def start(self, emit: EmitFn) -> None:
+        super().start(emit)
         with self._lock:
-            known = {pin["session"]["session_id"]: alias
-                     for (project, alias), pin in self._pins.items() if project == key}
-            result = _session_buffer_ids(sessions)
-            for session in sessions:
-                sid = session["session_id"]
-                if sid not in result:
-                    continue
-                alias = known.get(sid, result[sid])
-                full = SESSION_BUFFER_PREFIX + _session_key(sid)
-                while (key, alias) in self._pins and self._pins[key, alias]["session"]["session_id"] != sid:
-                    if len(alias) >= len(full):
-                        alias = ""  # Indistinguishable normalized identities cannot share an alias.
-                        break
-                    alias = full[:len(alias) + 1]
-                if not alias:
-                    result.pop(sid)
-                    continue
-                result[sid] = alias
-                self._pins.setdefault((key, alias), {"session": dict(session), "commit_id": None})
-            return result
+            self._closed = False
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="azo-project-history",
+                )
 
-    def issue_sessions(self, state, rows) -> dict[str, str]:
-        """Issue stable history links for metadata without reading any document."""
-        project_name, project_dir, _ = self._runtime_context(state)
-        if project_dir is None:
-            return {}
-        sessions, seen = [], set()
-        for raw in rows:
-            if not isinstance(raw, Mapping):
-                continue
-            sid = str(raw.get("session_id") or "").strip()
-            try:
-                _session_source(project_dir, sid)
-            except ValueError:
-                continue
-            if sid in seen:
-                continue
-            seen.add(sid)
-            sessions.append(dict(raw, session_id=sid))
-        return self._issue_aliases(self._project_key(project_name, project_dir), sessions)
-
-    @staticmethod
-    def _new_inventory() -> dict[str, Any]:
-        return dict(status="pending", sessions=[], error="", pending=False,
-                    has_snapshot=False, retry_at=0.0)
-
-    def _inventory_snapshot(self, key: str) -> dict[str, Any]:
+    def submit(self, op_id: OpId, req: IoRequest) -> None:
+        if not isinstance(req, self.request_types):
+            raise TypeError(
+                f"ProjectHistoryDriver expected LoadProjectCatalogRequest or "
+                f"LoadProjectSessionRequest, got {type(req).__name__}"
+            )
         with self._lock:
-            return dict(self._inventories[key])
+            if self._closed or op_id in self._cancelled:
+                return
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="azo-project-history",
+                )
+            fut = self._executor.submit(self._execute, op_id, req)
+            self._futures[op_id] = fut
+            self._in_flight[op_id] = req
 
-    def _request_inventory(self, project_name: str, project_dir: Path,
-                           current_session_id: str) -> str:
-        key = self._project_key(project_name, project_dir)
+    def cancel(self, op_id: OpId) -> None:
         with self._lock:
-            record = self._inventories.setdefault(key, self._new_inventory())
-            if record["pending"] or self.clock() < record["retry_at"]:
-                return key
-            record["pending"] = True
-            try:
-                self._work.put_nowait((key, project_name, project_dir, current_session_id))
-            except queue.Full:
-                record.update(pending=False, status="unavailable", error="catalog queue is full",
-                              retry_at=self.clock() + SESSION_INDEX_REFRESH_S)
-            if self._worker is None:
-                self._worker = threading.Thread(target=self._worker_loop,
-                                                name="azo-project-session-catalog", daemon=True)
-                self._worker.start()
-        return key
+            self._cancelled.add(op_id)
+            fut = self._futures.get(op_id)
+            self._in_flight.pop(op_id, None)
+        if fut is not None:
+            fut.cancel()
 
-    def _worker_loop(self) -> None:
-        while True:
-            try:
-                payload = self._work.get(timeout=SESSION_WORKER_IDLE_S)
-            except queue.Empty:
-                # Enqueue and idle exit share the lock; no lost wakeup on restart.
-                with self._lock:
-                    if self._work.empty():
-                        self._worker = None
-                        return
-                continue
-            try:
-                self._read_inventory(*payload)
-            finally:
-                self._work.task_done()
+    def quiesce(
+        self,
+        *,
+        policy: str = "terminate",
+        deadline: float | None = None,
+    ) -> list[Event]:
+        del deadline
+        with self._lock:
+            in_flight = list(self._in_flight.keys())
+            futures = list(self._futures.values())
+            self._cancelled.update(in_flight)
+            self._in_flight.clear()
+            self._futures.clear()
+        for fut in futures:
+            fut.cancel()
+        reason = f"quiesce:{policy}"
+        return [IoInterrupted(op_id=op_id, reason=reason) for op_id in in_flight]
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            futures = list(self._futures.values())
+            self._cancelled.update(self._futures.keys())
+            self._futures.clear()
+            self._in_flight.clear()
+            executor = self._executor
+            self._executor = None
+        for fut in futures:
+            fut.cancel()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        with self._lock:
+            self._cancelled.clear()
+
+    def _is_fenced(self, op_id: OpId) -> bool:
+        with self._lock:
+            return self._closed or op_id in self._cancelled
 
     @staticmethod
     def _read_catalog_snapshot(project_name: str, project_dir: Path):
@@ -847,337 +886,991 @@ class ProjectSessionBuffers:
             "present",
         )
 
-    def _read_inventory(self, key, project_name, project_dir, current_session_id) -> None:
+    def _execute(self, op_id: OpId, req: IoRequest) -> None:
         try:
-            snapshot = self._read_catalog_snapshot(project_name, project_dir)
-            update = dict(sessions=_eligible_project_sessions(snapshot.entries, current_session_id),
-                          has_snapshot=True, status="absent" if snapshot.absent else "ready", error="")
+            if self._is_fenced(op_id):
+                return
+            if isinstance(req, LoadProjectCatalogRequest):
+                value: Any = self._execute_catalog(req)
+            elif isinstance(req, LoadProjectSessionRequest):
+                value = self._execute_session(op_id, req)
+            else:
+                raise TypeError(f"Unsupported request: {type(req).__name__}")
+            if self._is_fenced(op_id):
+                return
+            self._safe_emit(IoCompleted(op_id=op_id, value=value))
         except Exception as exc:
-            update = dict(status="unavailable", error=_bounded_history_error(exc))
-        with self._lock:
-            self._inventories[key].update(update, pending=False,
-                                          retry_at=self.clock() + SESSION_INDEX_REFRESH_S)
+            if not self._is_fenced(op_id):
+                self._safe_emit(IoFailed(op_id=op_id, error=exc))
+        finally:
+            with self._lock:
+                self._futures.pop(op_id, None)
+                self._in_flight.pop(op_id, None)
+                self._cancelled.discard(op_id)
 
-    def _local_state_root(self, state: Any, context: Mapping[str, Any]) -> str | None:
-        value = (
-            context.get("local_state_root")
-            or getattr(state, "_local_state_root", "")
-            or getattr(state, "local_state_root", "")
+    def _execute_catalog(self, req: LoadProjectCatalogRequest) -> ProjectCatalogResult:
+        try:
+            snapshot = self._read_catalog_snapshot(req.project_name, Path(req.project_dir))
+            sessions = tuple(
+                _eligible_project_sessions(snapshot.entries, req.current_session_id)
+            )
+            return ProjectCatalogResult(
+                project_name=req.project_name,
+                project_dir=req.project_dir,
+                status="absent" if snapshot.absent else "ready",
+                sessions=sessions,
+                error="",
+            )
+        except Exception as exc:
+            return ProjectCatalogResult(
+                project_name=req.project_name,
+                project_dir=req.project_dir,
+                status="unavailable",
+                sessions=(),
+                error=_bounded_history_error(exc),
+            )
+
+    def _execute_session(
+        self,
+        op_id: OpId,
+        req: LoadProjectSessionRequest,
+    ) -> ProjectSessionResult:
+        from agent_zoo.storage.load import PendingSessionLoad, load_session
+
+        session_id = str(req.session.get("session_id") or "")
+        locator = _session_source(Path(req.project_dir), session_id)
+        loaded = load_session(
+            locator,
+            session_id=session_id,
+            commit_id=req.commit_id,
+            local_state_root=req.local_state_root,
+            timeout_s=0.0,
         )
-        text = str(value or "").strip()
-        return text or None
+        if isinstance(loaded, PendingSessionLoad):
+            deadline = time.monotonic() + self._load_wait_timeout_s
+            while isinstance(loaded, PendingSessionLoad):
+                if self._is_fenced(op_id):
+                    raise RuntimeError("session history load cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for saved session history")
+                loaded = loaded.wait(timeout_s=min(0.25, remaining))
+        saved = loaded.state
+        if not saved.commit_id or not isinstance(saved.document, Mapping):
+            raise ValueError("session loader returned no canonical committed document")
+        if saved.session_id != session_id:
+            raise ValueError("session loader returned a different session")
+        if req.commit_id is not None and saved.commit_id != req.commit_id:
+            raise ValueError("session loader did not return the pinned commit")
+
+        commit_id = req.commit_id
+        instance_id = req.instance_id
+        source_format = req.source_format
+        generated_at = req.generated_at
+        receipt_text = req.receipt
+        if commit_id is None:
+            source = _one_line_text(loaded.source, "unknown")
+            receipt = [
+                f"Session source: {source}.",
+                f"Source Repository: {saved.repository}",
+                f"Source Commit Created (UTC): {_format_utc(saved.created_at)}",
+                "Pinned projection: first observation retained until backend restart; "
+                "restart releases the pin, not local saved history. "
+                "No cross-host latest-state guarantee.",
+                "Saved history only; unsaved runtime activity is not included.",
+            ]
+            if saved.journal_path is not None:
+                receipt.append(f"Source Journal: {saved.journal_path}")
+            if source == "local":
+                receipt.append(
+                    "Session note: local-first source alone does not establish shared freshness."
+                )
+            receipt.append(f"Freshness: {loaded.freshness}")
+            if loaded.warning:
+                receipt.append(f"Session note: {_bounded_history_error(loaded.warning)}")
+            commit_id = saved.commit_id
+            instance_id = saved.instance_id
+            source_format = saved.source_format
+            generated_at = float(self._clock())
+            receipt_text = "\n".join(receipt)
+
+        formatter = _build_full_transcript if req.full else _build_compact_transcript
+        navigation = (
+            f"View: {'full' if req.full else 'compact'}\n"
+            f"Compact buffer: {req.alias}\nFull buffer: {req.alias}_full"
+        )
+        text = (
+            receipt_text
+            + "\n"
+            + navigation
+            + "\n\n"
+            + formatter(
+                req.session,
+                saved.document,
+                commit_id=commit_id,
+                instance_id=instance_id,
+                source_format=source_format,
+                generated_at=generated_at,
+            )
+        )
+        return ProjectSessionResult(
+            project_name=req.project_name,
+            project_dir=req.project_dir,
+            alias=req.alias,
+            full=req.full,
+            commit_id=commit_id,
+            instance_id=instance_id,
+            source_format=source_format,
+            generated_at=generated_at,
+            receipt=receipt_text,
+            text=text,
+        )
+
+
+@dataclass
+class ProjectMemoryRuntime:
+    """Strictly ephemeral per-session runtime snapshots (never serialized)."""
+
+    # History buffer runtime state
+    history_clock: Callable[[], float] = time.time
+    inventories: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_catalog_ops: dict[str, str] = field(default_factory=dict)
+    pins: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    session_requests: OrderedDict[tuple[str, str], dict[str, Any]] = field(
+        default_factory=OrderedDict
+    )
+    pending_session_ops: dict[str, tuple[str, str, bool]] = field(default_factory=dict)
+    texts: OrderedDict[tuple[str, str], tuple[str, int]] = field(default_factory=OrderedDict)
+    one_shot_texts: dict[tuple[str, str], str] = field(default_factory=dict)
+    text_bytes: int = 0
+    history_enabled: bool = False
+
+    # Live-session buffer runtime state
+    live_clock: Callable[[], float] = time.time
+    live_snapshots: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    live_pending_ops: dict[str, tuple[str, str]] = field(default_factory=dict)
+    live_row_limit: int = 1000
+
+
+def _runtime(state: Any) -> ProjectMemoryRuntime:
+    getter = getattr(state, "runtime", None)
+    if callable(getter):
+        return getter("project_memory", ProjectMemoryRuntime)
+    existing = getattr(state, "_project_memory_runtime", None)
+    if isinstance(existing, ProjectMemoryRuntime):
+        return existing
+    rt = ProjectMemoryRuntime()
+    try:
+        setattr(state, "_project_memory_runtime", rt)
+    except Exception:
+        pass
+    return rt
+
+
+def _context(state: Any) -> Mapping[str, Any]:
+    value = getattr(state, "_agent_zoo_context", None)
+    return value if isinstance(value, Mapping) else {}
+
+
+def _project_key(project_name: str, project_dir: Path) -> str:
+    return f"{project_name}\x00{os.path.abspath(os.fspath(project_dir))}"
+
+
+def _history_runtime_context(state: Any) -> tuple[str, Path | None, str]:
+    context = _context(state)
+    smeta = session_state(state)
+    project_name = str(context.get("project_name") or smeta.project_name or "default")
+    current_session_id = str(smeta.session_id or context.get("session_id") or "")
+    project_dir_raw = str(context.get("project_dir") or "").strip()
+    if project_dir_raw:
+        project_dir = Path(project_dir_raw)
+    else:
+        index_raw = str(context.get("project_session_index") or "").strip()
+        if index_raw:
+            project_dir = Path(index_raw).parent.parent
+        else:
+            return project_name, None, current_session_id
+    return project_name, project_dir, current_session_id
+
+
+def _local_state_root(state: Any) -> str:
+    context = _context(state)
+    value = (
+        context.get("local_state_root")
+        or getattr(state, "_local_state_root", "")
+        or getattr(state, "local_state_root", "")
+    )
+    return str(value or "").strip()
+
+
+def _new_inventory() -> dict[str, Any]:
+    return dict(
+        status="pending",
+        sessions=[],
+        error="",
+        pending=False,
+        op_id=None,
+        has_snapshot=False,
+        retry_at=0.0,
+    )
+
+
+def _issue_aliases_in_runtime(
+    rt: ProjectMemoryRuntime,
+    key: str,
+    sessions: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    known = {
+        pin["session"]["session_id"]: alias
+        for (project, alias), pin in rt.pins.items()
+        if project == key
+    }
+    result = _session_buffer_ids(sessions)
+    for session in sessions:
+        sid = session["session_id"]
+        if sid not in result:
+            continue
+        alias = known.get(sid, result[sid])
+        full = SESSION_BUFFER_PREFIX + _session_key(sid)
+        while (key, alias) in rt.pins and rt.pins[key, alias]["session"]["session_id"] != sid:
+            if len(alias) >= len(full):
+                alias = ""
+                break
+            alias = full[: len(alias) + 1]
+        if not alias:
+            result.pop(sid)
+            continue
+        result[sid] = alias
+        rt.pins.setdefault((key, alias), {"session": dict(session), "commit_id": None})
+    return result
+
+
+def _issue_sessions_for_state(state: Any, rows: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """Issue stable history links for metadata without reading any document."""
+    project_name, project_dir, _ = _history_runtime_context(state)
+    if project_dir is None:
+        return {}
+    sessions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        sid = str(raw.get("session_id") or "").strip()
+        try:
+            _session_source(project_dir, sid)
+        except ValueError:
+            continue
+        if sid in seen:
+            continue
+        seen.add(sid)
+        sessions.append(dict(raw, session_id=sid))
+    return _issue_aliases_in_runtime(_runtime(state), _project_key(project_name, project_dir), sessions)
+
+
+def _reconcile_active_ops(state: Any, rt: ProjectMemoryRuntime) -> None:
+    io = getattr(state, "io", None)
+    is_active = getattr(io, "is_active", None)
+    if not callable(is_active):
+        return
+    for op_id, key in list(rt.pending_catalog_ops.items()):
+        if not is_active(op_id):
+            rt.pending_catalog_ops.pop(op_id, None)
+            rec = rt.inventories.get(key)
+            if rec is not None and rec.get("op_id") == op_id:
+                rec.update(pending=False, op_id=None)
+    for op_id, (key, base, _full) in list(rt.pending_session_ops.items()):
+        if not is_active(op_id):
+            rt.pending_session_ops.pop(op_id, None)
+            req = rt.session_requests.get((key, base))
+            if req is not None and req.get("op_id") == op_id:
+                req.update(pending=False, op_id=None)
+
+
+def _request_inventory_io(
+    state: Any,
+    project_name: str,
+    project_dir: Path,
+    current_session_id: str,
+    *,
+    now: float | None = None,
+) -> str:
+    rt = _runtime(state)
+    _reconcile_active_ops(state, rt)
+    key = _project_key(project_name, project_dir)
+    record = rt.inventories.setdefault(key, _new_inventory())
+    ts = float(rt.history_clock() if now is None else now)
+    if record["pending"] or ts < float(record["retry_at"] or 0.0):
+        return key
+    io = getattr(state, "io", None)
+    if io is None or not callable(getattr(io, "submit", None)):
+        return key
+    if len(rt.pending_catalog_ops) >= SESSION_LOAD_QUEUE_LIMIT:
+        record.update(
+            pending=False,
+            op_id=None,
+            status="unavailable",
+            error="catalog queue is full",
+            retry_at=ts + SESSION_INDEX_REFRESH_S,
+        )
+        return key
+    op_id = io.submit(
+        LoadProjectCatalogRequest(
+            project_name=project_name,
+            project_dir=os.path.abspath(os.fspath(project_dir)),
+            current_session_id=current_session_id,
+        ),
+        tag="project_memory_catalog",
+    )
+    rt.pending_catalog_ops[op_id] = key
+    record.update(pending=True, op_id=op_id)
+    return key
+
+
+def _inventory_status_lines(record: Mapping[str, Any]) -> list[str]:
+    status = str(record.get("status") or "pending")
+    sessions = list(record.get("sessions", []) or [])
+    if record.get("pending"):
+        status = "pending"
+    if status == "pending":
+        if sessions:
+            return ["Inventory: refresh pending; showing the last good metadata snapshot."]
+        return ["Inventory: pending; initial metadata read is still in progress."]
+    if status == "unavailable":
+        detail = _bounded_history_error(record.get("error"))
+        if sessions:
+            return [
+                f"Inventory: unavailable ({detail}); showing the last good metadata snapshot."
+            ]
+        return [f"Inventory: unavailable ({detail})."]
+    if status == "absent":
+        return ["Inventory: absent; no published session catalog is available."]
+    return ["Inventory: ready."]
+
+
+def _status_view(buffer_id: str, status: str, detail: str) -> ReadonlyBufferView:
+    label = "pending" if status == "pending" else "unavailable"
+    return ReadonlyBufferView(
+        id=buffer_id,
+        path=f"project-memory://sessions/{buffer_id}/{label}",
+        text=f"Session buffer {buffer_id}:\n{detail}\n",
+    )
+
+
+def _ready_view(alias: str, pin: Mapping[str, Any], text: str) -> ReadonlyBufferView:
+    suffix = "/full" if alias.endswith("_full") else ""
+    return ReadonlyBufferView(
+        id=alias,
+        path=f"project-memory://sessions/{pin['session']['session_id']}/commits/{pin['commit_id']}{suffix}",
+        text=text,
+    )
+
+
+def _render_project_sessions_buffer(state: State) -> ReadonlyBufferView:
+    """Pure top-level special-buffer renderer for ``project_sessions``."""
+    rt = _runtime(state)
+    project_name, project_dir, current_session_id = _history_runtime_context(state)
+    if project_dir is None:
+        return ReadonlyBufferView(
+            id=PROJECT_SESSIONS_BUFFER_ID,
+            path="project-memory://sessions/pending",
+            text=(
+                "Project Sessions\n"
+                f"Project: {project_name}\n"
+                "Inventory: pending; Agent Zoo project context is not attached yet.\n"
+            ),
+        )
+    key = _request_inventory_io(state, project_name, project_dir, current_session_id)
+    record = dict(rt.inventories.get(key) or _new_inventory())
+    sessions = record["sessions"]
+    buffer_ids = _issue_aliases_in_runtime(rt, key, sessions)
+    lines = [
+        "Project Sessions",
+        f"Project: {project_name}",
+        f"Buffer Generated (UTC): {_format_utc(rt.history_clock())}",
+        "Order: Updated (UTC), newest first",
+        "Current session omitted; RLM sessions excluded.",
+        *_inventory_status_lines(record),
+        f"Sessions: {len(buffer_ids)}",
+    ]
+    listed = 0
+    for session in sessions:
+        session_id = str(session["session_id"])
+        buffer_id = buffer_ids.get(session_id)
+        if not buffer_id:
+            continue
+        listed += 1
+        lines.extend(
+            [
+                "",
+                (
+                    f"{listed}. Buffer: {buffer_id} | Full: {buffer_id}_full | Session ID: {session_id} | "
+                    f"Updated (UTC): {_format_utc(session.get('updated_at'))} | "
+                    f"Created (UTC): {_format_utc(session.get('created_at'))}"
+                ),
+                (
+                    f"   Title: {_one_line_text(session.get('title'), '(untitled)')} | "
+                    f"Description: {_one_line_text(session.get('description'), '(none)')}"
+                ),
+            ]
+        )
+    return ReadonlyBufferView(
+        id=PROJECT_SESSIONS_BUFFER_ID,
+        path="project-memory://sessions",
+        text="\n".join(lines).rstrip() + "\n",
+    )
+
+
+def _render_project_session_buffer(state: State, buffer_id: str) -> ReadonlyBufferView | None:
+    """Pure top-level special-buffer namespace renderer for ``ses_*`` buffers."""
+    requested = str(buffer_id or "").strip().lower()
+    match = re.fullmatch(r"(ses_[0-9a-z]{8,})(_full)?", requested)
+    if match is None:
+        return None
+    base, full = match.group(1), bool(match.group(2))
+    project_name, project_dir, current_session_id = _history_runtime_context(state)
+    if project_dir is None:
+        return _status_view(requested, "pending", "Agent Zoo project context is not attached yet.")
+    rt = _runtime(state)
+    _reconcile_active_ops(state, rt)
+    key = _project_key(project_name, project_dir)
+    scope, text_scope = (key, base), (key, requested)
+
+    pin = rt.pins.get(scope)
+    if pin is not None:
+        cached = rt.texts.get(text_scope)
+        if cached is not None:
+            rt.texts.move_to_end(text_scope)
+            return _ready_view(requested, pin, cached[0])
+        one_shot = rt.one_shot_texts.pop(text_scope, None)
+        if one_shot is not None:
+            return _ready_view(requested, pin, one_shot)
+
+    if pin is None:
+        _request_inventory_io(state, project_name, project_dir, current_session_id)
+        record = rt.inventories.get(key) or _new_inventory()
+        _issue_aliases_in_runtime(rt, key, record["sessions"])
+        pin = rt.pins.get(scope)
+        if pin is None:
+            if record["pending"] or record["status"] == "unavailable":
+                return _status_view(
+                    requested,
+                    "pending" if record["pending"] else "unavailable",
+                    "Metadata inventory: "
+                    + (record["error"] or "read in progress; retry shortly."),
+                )
+            return None
+
+    now = float(rt.history_clock())
+    request = rt.session_requests.get(scope)
+    if request is not None:
+        if request.get("pending"):
+            session = pin["session"]
+            return _status_view(
+                requested,
+                "pending",
+                f"Title: {_one_line_text(session.get('title'), '(untitled)')}\n"
+                f"Description: {_one_line_text(session.get('description'), '(none)')}\n"
+                "Transcript load requested. Please try again shortly.",
+            )
+        if request.get("error") and now < float(request.get("retry_at") or 0.0):
+            return _status_view(requested, "unavailable", str(request["error"]))
+
+    if request is None:
+        for other in list(rt.session_requests):
+            if len(rt.session_requests) < SESSION_LOAD_QUEUE_LIMIT:
+                break
+            other_req = rt.session_requests[other]
+            if not other_req.get("pending") and other_req.get("error"):
+                del rt.session_requests[other]
+        if len(rt.session_requests) >= SESSION_LOAD_QUEUE_LIMIT:
+            return _status_view(
+                requested,
+                "unavailable",
+                "History request capacity is busy; retry shortly.",
+            )
+        request = dict(pending=False, op_id=None, error="", retry_at=0.0, full=full)
+        rt.session_requests[scope] = request
+
+    io = getattr(state, "io", None)
+    if io is not None and callable(getattr(io, "submit", None)):
+        local_root = _local_state_root(state) or None
+        op_id = io.submit(
+            LoadProjectSessionRequest(
+                project_name=project_name,
+                project_dir=os.path.abspath(os.fspath(project_dir)),
+                alias=base,
+                full=full,
+                session=dict(pin["session"]),
+                commit_id=pin.get("commit_id"),
+                instance_id=str(pin.get("instance_id") or ""),
+                source_format=str(pin.get("source_format") or ""),
+                generated_at=float(pin.get("generated_at") or 0.0),
+                receipt=str(pin.get("receipt") or ""),
+                local_state_root=local_root,
+            ),
+            tag="project_memory_session",
+        )
+        request.update(pending=True, op_id=op_id, error="", retry_at=0.0, full=full)
+        rt.pending_session_ops[op_id] = (key, base, full)
+
+    session = pin["session"]
+    return _status_view(
+        requested,
+        "pending",
+        f"Title: {_one_line_text(session.get('title'), '(untitled)')}\n"
+        f"Description: {_one_line_text(session.get('description'), '(none)')}\n"
+        "Transcript load requested. Please try again shortly.",
+    )
+
+
+class ProjectSessionBuffers:
+    """Pure Sans-I/O manager for project session history special buffers.
+
+    All catalog & saved-session reads run off-loop in ``ProjectHistoryDriver``.
+    Snapshots, pins, and bounded LRU projections live in
+    ``state.runtime("project_memory", ProjectMemoryRuntime)``.
+    """
+
+    handles = (
+        SessionReady,
+        SessionRestored,
+        RenderRequested,
+        TurnSettled,
+        RunToolCall,
+        IoCompleted,
+        IoFailed,
+        IoInterrupted,
+    )
+    init = {"buffer_manager": BufferManager}
+    reads = {"buffer_manager"}
+    optional_reads = {"_agent_zoo_context", "_local_state_root"}
+    writes = {"buffer_manager"}
+
+    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
+        self.clock = clock
 
     def bind_state(self, state: State) -> State:
         manager = getattr(state, "buffer_manager", None)
         if not isinstance(manager, BufferManager):
             manager = BufferManager()
             state.buffer_manager = manager
-        context = dict(getattr(state, "_agent_zoo_context", {}) or {})
-        context_project_name = str(context.get("project_name") or "").strip()
-        if context_project_name:
-            self._project_name = context_project_name
-        context_session_id = str(getattr(state, "_session_id", "") or context.get("session_id") or "").strip()
-        if context_session_id:
-            self._session_id = context_session_id
-
-        setattr(state, PROJECT_SESSION_INDEX_RENDER_ATTR, functools.partial(self.render_index, state))
-        setattr(state, PROJECT_SESSION_RENDER_ATTR, functools.partial(self.render_session, state))
+        rt = _runtime(state)
+        rt.history_clock = self.clock
+        rt.history_enabled = True
         manager.register_special_buffer(
             PROJECT_SESSIONS_BUFFER_ID,
-            operator.methodcaller(PROJECT_SESSION_INDEX_RENDER_ATTR),
+            _render_project_sessions_buffer,
             replace=True,
         )
         manager.register_special_buffer_namespace(
             SESSION_BUFFER_PREFIX,
-            StateBoundSpecialBufferNamespaceProvider(PROJECT_SESSION_RENDER_ATTR),
+            _render_project_session_buffer,
             replace=True,
         )
-        project_name, project_dir, current_session_id = self._runtime_context(state)
-        if project_dir is not None:
-            self._request_inventory(project_name, project_dir, current_session_id)
         return state
 
+    def issue_sessions(self, state: Any, rows: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+        """Issue stable history links for metadata without reading any document."""
+        rt = _runtime(state)
+        rt.history_clock = self.clock
+        rt.history_enabled = True
+        return _issue_sessions_for_state(state, rows)
+
+    def render_index(self, state: State) -> ReadonlyBufferView:
+        rt = _runtime(state)
+        rt.history_clock = self.clock
+        rt.history_enabled = True
+        return _render_project_sessions_buffer(state)
+
+    def render_session(self, state: State, buffer_id: str) -> ReadonlyBufferView | None:
+        rt = _runtime(state)
+        rt.history_clock = self.clock
+        rt.history_enabled = True
+        return _render_project_session_buffer(state, buffer_id)
+
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
-        del event, emit
+        del emit
+        rt = _runtime(state)
+        rt.history_clock = self.clock
+        rt.history_enabled = True
+
+        if isinstance(event, IoCompleted):
+            self._handle_completed(event, rt)
+            return
+        if isinstance(event, IoFailed):
+            self._handle_failed(event, rt)
+            return
+        if isinstance(event, IoInterrupted):
+            self._handle_interrupted(event, rt)
+            return
+
+        if isinstance(event, SessionRestored):
+            # Previous process IO ops cannot complete after restore; clear pending markers.
+            rt.pending_catalog_ops.clear()
+            rt.pending_session_ops.clear()
+            for rec in rt.inventories.values():
+                rec.update(pending=False, op_id=None, retry_at=0.0)
+            for req in rt.session_requests.values():
+                req.update(pending=False, op_id=None, retry_at=0.0)
+
         self.bind_state(state)
+        project_name, project_dir, current_session_id = _history_runtime_context(state)
+        if project_dir is not None:
+            _request_inventory_io(state, project_name, project_dir, current_session_id)
 
-    def _runtime_context(self, state) -> tuple[str, Path | None, str]:
-        context = dict(getattr(state, "_agent_zoo_context", {}) or {})
-        project_name = str(context.get("project_name") or self._project_name or "default")
-        current_session_id = str(
-            getattr(state, "_session_id", "")
-            or self._session_id
-            or context.get("session_id")
-            or ""
-        )
-        project_dir_raw = str(context.get("project_dir") or "").strip()
-        if project_dir_raw:
-            project_dir = Path(project_dir_raw)
-        else:
-            index_raw = str(context.get("project_session_index") or "").strip()
-            if index_raw:
-                project_dir = Path(index_raw).parent.parent
+    def _handle_completed(self, event: IoCompleted, rt: ProjectMemoryRuntime) -> None:
+        cat_key = rt.pending_catalog_ops.pop(event.op_id, None)
+        if cat_key is not None:
+            record = rt.inventories.setdefault(cat_key, _new_inventory())
+            val = event.value
+            if isinstance(val, ProjectCatalogResult):
+                if val.status in {"ready", "absent"}:
+                    record.update(
+                        sessions=list(val.sessions),
+                        has_snapshot=True,
+                        status=val.status,
+                        error="",
+                        pending=False,
+                        op_id=None,
+                        retry_at=float(rt.history_clock()) + SESSION_INDEX_REFRESH_S,
+                    )
+                else:
+                    record.update(
+                        status="unavailable",
+                        error=_bounded_history_error(val.error),
+                        pending=False,
+                        op_id=None,
+                        retry_at=float(rt.history_clock()) + SESSION_INDEX_REFRESH_S,
+                    )
             else:
-                return project_name, None, current_session_id
-        return project_name, project_dir, current_session_id
+                record.update(
+                    status="unavailable",
+                    error="invalid project catalog result",
+                    pending=False,
+                    op_id=None,
+                    retry_at=float(rt.history_clock()) + SESSION_INDEX_REFRESH_S,
+                )
+            return
 
-    @staticmethod
-    def _inventory_status_lines(record: Mapping[str, Any]) -> list[str]:
-        status = str(record.get("status") or "pending")
-        sessions = list(record.get("sessions", []) or [])
-        if record.get("pending"):
-            status = "pending"
-        if status == "pending":
-            if sessions:
-                return ["Inventory: refresh pending; showing the last good metadata snapshot."]
-            return ["Inventory: pending; initial metadata read is still in progress."]
-        if status == "unavailable":
-            detail = _bounded_history_error(record.get("error"))
-            if sessions:
-                return [
-                    f"Inventory: unavailable ({detail}); showing the last good metadata snapshot."
-                ]
-            return [f"Inventory: unavailable ({detail})."]
-        if status == "absent":
-            return ["Inventory: absent; no published session catalog is available."]
-        return ["Inventory: ready."]
+        sess_meta = rt.pending_session_ops.pop(event.op_id, None)
+        if sess_meta is None:
+            return
+        key, base, full = sess_meta
+        scope = (key, base)
+        alias = base + ("_full" if full else "")
+        text_scope = (key, alias)
+        pin = rt.pins.get(scope)
+        val = event.value
+        if pin is None or not isinstance(val, ProjectSessionResult):
+            req = rt.session_requests.get(scope)
+            if req is not None:
+                req.update(
+                    pending=False,
+                    op_id=None,
+                    error="invalid project session result",
+                    retry_at=float(rt.history_clock()) + SESSION_LOAD_RETRY_S,
+                )
+            return
 
-    def render_index(self, state) -> ReadonlyBufferView:
-        project_name, project_dir, current_session_id = self._runtime_context(state)
-        if project_dir is None:
-            return ReadonlyBufferView(
-                id=PROJECT_SESSIONS_BUFFER_ID,
-                path="project-memory://sessions/pending",
-                text=(
-                    "Project Sessions\n"
-                    f"Project: {project_name}\n"
-                    "Inventory: pending; Agent Zoo project context is not attached yet.\n"
-                ),
+        if pin.get("commit_id") is None:
+            pin.update(
+                commit_id=val.commit_id,
+                instance_id=val.instance_id,
+                source_format=val.source_format,
+                generated_at=val.generated_at,
+                receipt=val.receipt,
             )
-        key = self._request_inventory(project_name, project_dir, current_session_id)
-        record = self._inventory_snapshot(key)
-        sessions = record["sessions"]
-        buffer_ids = self._issue_aliases(key, sessions)
-        lines = [
-            "Project Sessions",
-            f"Project: {project_name}",
-            f"Buffer Generated (UTC): {_format_utc(self.clock())}",
-            "Order: Updated (UTC), newest first",
-            "Current session omitted; RLM sessions excluded.",
-            *self._inventory_status_lines(record),
-            f"Sessions: {len(buffer_ids)}",
-        ]
-        listed = 0
-        for session in sessions:
-            session_id = str(session["session_id"])
-            buffer_id = buffer_ids.get(session_id)
-            if not buffer_id:
-                continue
-            listed += 1
-            lines.extend(
-                [
-                    "",
-                    (
-                        f"{listed}. Buffer: {buffer_id} | Full: {buffer_id}_full | Session ID: {session_id} | "
-                        f"Updated (UTC): {_format_utc(session.get('updated_at'))} | "
-                        f"Created (UTC): {_format_utc(session.get('created_at'))}"
-                    ),
-                    (
-                        f"   Title: {_one_line_text(session.get('title'), '(untitled)')} | "
-                        f"Description: {_one_line_text(session.get('description'), '(none)')}"
-                    ),
-                ]
+
+        size = len(val.text.encode("utf-8"))
+        previous = rt.texts.pop(text_scope, None)
+        if previous is not None:
+            rt.text_bytes -= previous[1]
+        if size <= SESSION_PROJECTION_CACHE_BYTES:
+            while rt.texts and rt.text_bytes + size > SESSION_PROJECTION_CACHE_BYTES:
+                _, (_, removed) = rt.texts.popitem(last=False)
+                rt.text_bytes -= removed
+            rt.texts[text_scope] = (val.text, size)
+            rt.text_bytes += size
+            rt.one_shot_texts.pop(text_scope, None)
+        else:
+            # Oversize projection: deliver once on next read, never retain in LRU cache.
+            rt.one_shot_texts[text_scope] = val.text
+        rt.session_requests.pop(scope, None)
+
+    def _handle_failed(self, event: IoFailed, rt: ProjectMemoryRuntime) -> None:
+        cat_key = rt.pending_catalog_ops.pop(event.op_id, None)
+        if cat_key is not None:
+            record = rt.inventories.setdefault(cat_key, _new_inventory())
+            record.update(
+                status="unavailable",
+                error=_bounded_history_error(event.error),
+                pending=False,
+                op_id=None,
+                retry_at=float(rt.history_clock()) + SESSION_INDEX_REFRESH_S,
             )
-        return ReadonlyBufferView(
-            id=PROJECT_SESSIONS_BUFFER_ID,
-            path="project-memory://sessions",
-            text="\n".join(lines).rstrip() + "\n",
-        )
+            return
 
-    @staticmethod
-    def _status_view(buffer_id: str, status: str, detail: str) -> ReadonlyBufferView:
-        label = "pending" if status == "pending" else "unavailable"
-        return ReadonlyBufferView(
-            id=buffer_id,
-            path=f"project-memory://sessions/{buffer_id}/{label}",
-            text=(
-                f"Session buffer {buffer_id}:\n"
-                f"{detail}\n"
-            ),
-        )
+        sess_meta = rt.pending_session_ops.pop(event.op_id, None)
+        if sess_meta is None:
+            return
+        key, base, _full = sess_meta
+        scope = (key, base)
+        req = rt.session_requests.get(scope)
+        if req is not None:
+            req.update(
+                pending=False,
+                op_id=None,
+                error=_bounded_history_error(event.error),
+                retry_at=float(rt.history_clock()) + SESSION_LOAD_RETRY_S,
+            )
 
-    @staticmethod
-    def _ready_view(alias, pin, text) -> ReadonlyBufferView:
-        suffix = "/full" if alias.endswith("_full") else ""
-        return ReadonlyBufferView(id=alias,
-            path=f"project-memory://sessions/{pin['session']['session_id']}/commits/{pin['commit_id']}{suffix}",
-            text=text)
+    def _handle_interrupted(self, event: IoInterrupted, rt: ProjectMemoryRuntime) -> None:
+        cat_key = rt.pending_catalog_ops.pop(event.op_id, None)
+        if cat_key is not None:
+            record = rt.inventories.get(cat_key)
+            if record is not None:
+                record.update(pending=False, op_id=None, retry_at=0.0)
+            return
 
-    def _observe(self, scope, pin, request, timeout_s, *, project=True,
-                 full=False) -> ReadonlyBufferView | None:
-        from agent_zoo.storage.load import PendingSessionLoad, load_session
-
-        alias = scope[1] + ("_full" if full else "")
-        text_scope = scope[0], alias
-        # Both projections share this lock and the canonical request, not text.
-        if not request["lock"].acquire(blocking=False):
-            return None
-        try:
-            with self._lock:
-                if self._requests.get(scope) is not request:
-                    return None
-                if request["error"] and self.clock() < request["retry_at"]:
-                    return self._status_view(alias, "unavailable", request["error"])
-                request["error"] = ""
-            loaded = request["handle"]
-            if loaded is None:
-                loaded = load_session(request["locator"], session_id=pin["session"]["session_id"],
-                                      commit_id=pin["commit_id"], local_state_root=request["local_root"],
-                                      timeout_s=0.0)
-                request["handle"] = loaded
-            if isinstance(loaded, PendingSessionLoad):
-                loaded = loaded.wait(timeout_s=timeout_s)
-                if isinstance(loaded, PendingSessionLoad):
-                    return None
-            saved = loaded.state
-            if not saved.commit_id or not isinstance(saved.document, Mapping):
-                raise ValueError("session loader returned no canonical committed document")
-            if saved.session_id != pin["session"]["session_id"]:
-                raise ValueError("session loader returned a different session")
-            if pin["commit_id"] is not None and saved.commit_id != pin["commit_id"]:
-                raise ValueError("session loader did not return the pinned commit")
-            if pin["commit_id"] is None:
-                source = _one_line_text(loaded.source, "unknown")
-                receipt = [f"Session source: {source}.", f"Source Repository: {saved.repository}",
-                           f"Source Commit Created (UTC): {_format_utc(saved.created_at)}",
-                           "Pinned projection: first observation retained until backend restart; "
-                           "restart releases the pin, not local saved history. "
-                           "No cross-host latest-state guarantee.",
-                           "Saved history only; unsaved runtime activity is not included."]
-                if saved.journal_path is not None:
-                    receipt.append(f"Source Journal: {saved.journal_path}")
-                if source == "local":
-                    receipt.append("Session note: local-first source alone does not establish shared freshness.")
-                receipt.append(f"Freshness: {loaded.freshness}")
-                if loaded.warning:
-                    receipt.append(f"Session note: {_bounded_history_error(loaded.warning)}")
-                pin.update(commit_id=saved.commit_id, instance_id=saved.instance_id,
-                           source_format=saved.source_format, generated_at=self.clock(),
-                           receipt="\n".join(receipt))
-            if not project:
-                with self._lock:
-                    del self._requests[scope]
-                return None
-            formatter = _build_full_transcript if full else _build_compact_transcript
-            navigation = (f"View: {'full' if full else 'compact'}\n"
-                          f"Compact buffer: {scope[1]}\nFull buffer: {scope[1]}_full")
-            text = pin["receipt"] + "\n" + navigation + "\n\n" + formatter(
-                pin["session"], saved.document, commit_id=pin["commit_id"],
-                instance_id=pin["instance_id"], source_format=pin["source_format"],
-                generated_at=pin["generated_at"])
-            size = len(text.encode("utf-8"))
-            with self._lock:
-                previous = self._texts.pop(text_scope, None)
-                if previous is not None:
-                    self._text_bytes -= previous[1]
-                if size <= SESSION_PROJECTION_CACHE_BYTES:
-                    while self._texts and self._text_bytes + size > SESSION_PROJECTION_CACHE_BYTES:
-                        _, (_, removed) = self._texts.popitem(last=False)
-                        self._text_bytes -= removed
-                    self._texts[text_scope] = (text, size)
-                    self._text_bytes += size
-                del self._requests[scope]
-            return self._ready_view(alias, pin, text)
-        except Exception as exc:
-            with self._lock:
-                request.update(handle=None, error=_bounded_history_error(exc),
-                               retry_at=self.clock() + SESSION_LOAD_RETRY_S)
-            return self._status_view(alias, "unavailable", request["error"])
-        finally:
-            request["lock"].release()
-
-    def render_session(self, state, buffer_id: str) -> ReadonlyBufferView | None:
-        requested = str(buffer_id or "").strip().lower()
-        match = re.fullmatch(r"(ses_[0-9a-z]{8,})(_full)?", requested)
-        if match is None:
-            return None
-        base, full = match.group(1), bool(match.group(2))
-        project_name, project_dir, current_session_id = self._runtime_context(state)
-        if project_dir is None:
-            return self._status_view(requested, "pending", "Agent Zoo project context is not attached yet.")
-        key = self._project_key(project_name, project_dir)
-        scope, text_scope = (key, base), (key, requested)
-        # Resolve issued identities before consulting mutable catalog metadata.
-        with self._lock:
-            pin = self._pins.get(scope)
-            cached = self._texts.get(text_scope)
-            if cached is not None:
-                self._texts.move_to_end(text_scope)
-                return self._ready_view(requested, pin, cached[0])
-        if pin is None:
-            self._request_inventory(project_name, project_dir, current_session_id)
-            record = self._inventory_snapshot(key)
-            self._issue_aliases(key, record["sessions"])
-            with self._lock:
-                pin = self._pins.get(scope)
-            if pin is None:
-                if record["pending"] or record["status"] == "unavailable":
-                    return self._status_view(requested, "pending" if record["pending"] else "unavailable",
-                                             "Metadata inventory: " + (record["error"] or "read in progress; retry shortly."))
-                return None
-
-        # Reclaim completed handles without projecting unrelated documents.
-        with self._lock:
-            completed = [(other, self._pins[other], req) for other, req in self._requests.items()
-                         if len(self._requests) >= SESSION_LOAD_QUEUE_LIMIT and other != scope
-                         and getattr(req["handle"], "done", False)]
-        for other, other_pin, req in completed:
-            self._observe(other, other_pin, req, 0.0, project=False)
-            with self._lock:
-                if len(self._requests) < SESSION_LOAD_QUEUE_LIMIT:
-                    break
-        with self._lock:
-            cached = self._texts.get(text_scope)
-            if cached is not None:
-                self._texts.move_to_end(text_scope)
-                return self._ready_view(requested, pin, cached[0])
-            request = self._requests.get(scope)
-            if request is None:
-                for other in list(self._requests):
-                    if len(self._requests) < SESSION_LOAD_QUEUE_LIMIT:
-                        break
-                    if self._requests[other]["error"]:
-                        del self._requests[other]
-                if len(self._requests) >= SESSION_LOAD_QUEUE_LIMIT:
-                    return self._status_view(requested, "unavailable", "History request capacity is busy; retry shortly.")
-                request = dict(lock=threading.Lock(), handle=None, error="", retry_at=0.0,
-                               locator=_session_source(project_dir, pin["session"]["session_id"]),
-                               local_root=self._local_state_root(state, getattr(state, "_agent_zoo_context", {}) or {}))
-                self._requests[scope] = request
-        view = self._observe(scope, pin, request, SESSION_OBSERVE_S, full=full)
-        if view is not None:
-            return view
-        session = pin["session"]
-        return self._status_view(requested, "pending",
-            f"Title: {_one_line_text(session.get('title'), '(untitled)')}\n"
-            f"Description: {_one_line_text(session.get('description'), '(none)')}\n"
-            "Transcript load requested. Please try again shortly.")
+        sess_meta = rt.pending_session_ops.pop(event.op_id, None)
+        if sess_meta is None:
+            return
+        key, base, _full = sess_meta
+        rt.session_requests.pop((key, base), None)
 
 
 _LIVE_TERMINAL_STATUSES = frozenset({"stopped", "exited", "failed", "cancelled", "completed"})
 _LIVE_HEALTH_FRESHNESS_S = 15.0
 
 
+def _live_store_root(state: Any) -> tuple[Path | None, str]:
+    context = _context(state)
+    raw = context.get("project_store_root")
+    if not raw:
+        project_dir = context.get("project_dir")
+        if not project_dir:
+            return None, "missing-context; no project coordination store is attached"
+        if not isinstance(project_dir, (str, os.PathLike)):
+            return None, "unavailable; invalid project directory context"
+        raw = Path(project_dir) / "coordination"
+    if not isinstance(raw, (str, os.PathLike)):
+        return None, "unavailable; invalid coordination store root"
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        return None, "unavailable; coordination store root must be absolute (cwd is not authoritative)"
+    return Path(os.path.normpath(os.fspath(root))), ""
+
+
+def _new_live_snapshot() -> dict[str, Any]:
+    return dict(
+        status="pending",
+        rows=(),
+        error="",
+        pending=False,
+        op_id=None,
+        snapshot_at=None,
+        attempt_at=None,
+        retry_at=None,
+    )
+
+
+def _row_health(row: LiveSessionInfo, *, now: float) -> tuple[str, bool, bool]:
+    """Return ``(health, is_terminal, is_confirmed_stopped)`` evaluated at ``now``."""
+    if row.is_terminal or str(row.status or "").lower() in _LIVE_TERMINAL_STATUSES:
+        return "unknown", True, bool(row.is_confirmed_stopped)
+    has_obs = bool(row.observation_reason) or row.observed_at > 0.0
+    if (
+        row.process_identity is None
+        or not has_obs
+        or not math.isfinite(now)
+        or not math.isfinite(row.observed_at)
+    ):
+        return "unknown", False, False
+    age = now - row.observed_at
+    if row.observed_at < 0 or age < 0:
+        return "unknown", False, False
+    pstate = str(row.process_state or "unknown").lower()
+    if pstate == "dead" or row.is_confirmed_stopped:
+        return "dead", False, True
+    return ("alive" if pstate == "alive" and age <= _LIVE_HEALTH_FRESHNESS_S else "unknown"), False, False
+
+
+def _render_live_sessions_buffer(
+    state: State,
+    *,
+    history_hook: Any | None = None,
+    row_limit_override: int | None = None,
+) -> ReadonlyBufferView:
+    """Pure top-level special-buffer renderer for ``live_sessions``."""
+    rt = _runtime(state)
+    context = _context(state)
+    smeta = session_state(state)
+    project = str(context.get("project_name") or smeta.project_name or "(unknown)")
+    root, context_error = _live_store_root(state)
+    now = float(rt.live_clock())
+    row_limit = rt.live_row_limit if row_limit_override is None else row_limit_override
+    lines = [
+        "Live Sessions",
+        f"Project: {_one_line_text(project, '(unknown)')}",
+        f"Buffer Generated (UTC): {_format_utc(now)}",
+        f"Liveness Evaluated (UTC): {_format_utc(now)}",
+        "Observational registry only; no processes, sockets, or agents were contacted.",
+        "Lifecycle 'running' does not mean the model is working; no working/idle/completion inference.",
+        "Endpoints are advertised, not verified routes. Remote loopback addresses are not implied reachable.",
+        "Exact buffer reads are cached within a model step; health is as of the displayed evaluation time.",
+    ]
+    if root is None:
+        lines.append(f"Registry: {context_error}.")
+        return ReadonlyBufferView(
+            id=ProjectLiveSessionBuffer.BUFFER_ID,
+            path="project-memory://live-sessions",
+            text="\n".join(lines) + "\n",
+        )
+    snapshot = rt.live_snapshots.get((project, os.fspath(root))) or _new_live_snapshot()
+    status = snapshot["status"]
+    has_snapshot = snapshot["snapshot_at"] is not None
+    lines.append(f"Coordination Store: {root}")
+    if snapshot["pending"] or (status == "pending" and not has_snapshot):
+        lines.append(
+            "Registry: refresh pending; last-good snapshot retained (stale)."
+            if has_snapshot
+            else "Registry: pending; initial background read has not completed."
+        )
+    elif status == "ready":
+        lines.append(
+            "Registry: ready."
+            if snapshot["rows"]
+            else "Registry: empty (successful read; zero instances)."
+        )
+    else:
+        lines.append(f"Registry: {status}; {snapshot['error']}.")
+        if has_snapshot:
+            lines.append(
+                "Last-good snapshot retained (stale); this is not a new registry observation."
+            )
+        else:
+            lines.append(
+                "No successful registry snapshot; this is not a known-empty registry."
+            )
+    lines.extend(
+        [
+            f"Registry Read (UTC; last successful): {_format_utc(snapshot['snapshot_at'])}",
+            f"Refresh Requested (UTC): {_format_utc(snapshot['attempt_at'])}",
+        ]
+    )
+    if not has_snapshot:
+        return ReadonlyBufferView(
+            id=ProjectLiveSessionBuffer.BUFFER_ID,
+            path="project-memory://live-sessions",
+            text="\n".join(lines) + "\n",
+        )
+    active = []
+    terminal = stopped = 0
+    for row in snapshot["rows"]:
+        health, is_terminal, is_stopped = _row_health(row, now=now)
+        if is_terminal:
+            terminal += 1
+        elif is_stopped:
+            stopped += 1
+        else:
+            active.append((row, health))
+    active.sort(key=lambda item: (item[0].session_id, item[0].instance_id))
+    alive = sum(health == "alive" for _, health in active)
+    lines.extend(
+        [
+            f"Registry Instances: {len(snapshot['rows'])}",
+            f"Active candidates: {len(active)}; confirmed alive: {alive}; unknown: {len(active) - alive}",
+            f"Excluded: {terminal} terminal lifecycle; {stopped} other confirmed-stopped instances.",
+            f"Rows shown: {min(len(active), row_limit)} of {len(active)} active candidates; "
+            f"truncated: {max(0, len(active) - row_limit)}.",
+            "Order: session ID, then instance ID. Current and child/RLM sessions are included.",
+        ]
+    )
+    shown = active[:row_limit]
+    aliases: dict[str, str] = {}
+    has_history = history_hook is not None or rt.history_enabled
+    if has_history:
+        identities: dict[str, dict[str, Any]] = {}
+        for row, _ in shown:
+            identities.setdefault(
+                row.session_id,
+                dict(
+                    session_id=row.session_id,
+                    title=row.title,
+                    description=row.description,
+                    kind=row.kind,
+                    updated_at=row.updated_at,
+                    created_at=row.started_at,
+                ),
+            )
+        if history_hook is not None and callable(getattr(history_hook, "issue_sessions", None)):
+            aliases = history_hook.issue_sessions(state, list(identities.values()))
+        else:
+            aliases = _issue_sessions_for_state(state, list(identities.values()))
+        lines.append(
+            "History links select a saved session continuation, NOT necessarily this runtime instance. "
+            "Check Source Instance/Commit; unsaved activity is absent. First-observation pins last until backend restart."
+        )
+    else:
+        lines.append("History: disabled; no transcript links registered.")
+    current = str(smeta.session_id or context.get("session_id") or "")
+    for row, health in shown:
+        has_obs = bool(row.observation_reason) or row.observed_at > 0.0
+        age = f"{now - row.observed_at:.1f}s" if has_obs else "(unknown)"
+        endpoint = _one_line_text(
+            sanitize_ws_url(row.websocket_url),
+            "(unavailable: malformed advertised endpoint)",
+        )
+        lines.extend(
+            [
+                "",
+                f"## Instance: {_one_line_text(row.instance_id, '(unknown)')}",
+                f"Session ID: {_one_line_text(row.session_id, '(unknown)')}",
+                f"Current session: {'yes' if row.session_id == current else 'no'} (session identity, not process identity)",
+                f"Title: {_one_line_text(row.title, '(none)')}",
+                f"Description: {_one_line_text(row.description, '(none)')}",
+                f"Kind: {_one_line_text(row.kind, '(unknown)')}",
+                f"Child/RLM: {'yes' if row.kind.lower().startswith('rlm') else 'not indicated'}",
+                f"Hostname: {_one_line_text(row.hostname, '(unknown)')}; PID: {row.pid}",
+                f"Lifecycle status: {_one_line_text(row.status, '(unknown)')}; process state: {health}",
+                f"Observation (UTC): {_format_utc(row.observed_at if has_obs else None)}; age: {age}",
+                f"Observation reason: {_one_line_text(row.observation_reason, '(not recorded)')}",
+                f"Metadata Updated (UTC): {_format_utc(row.updated_at)}",
+                f"Websocket endpoint: {endpoint}",
+            ]
+        )
+        if has_history:
+            alias = aliases.get(row.session_id)
+            lines.append(
+                f"Saved history: {alias} | {alias}_full (availability checked on open)"
+                if alias
+                else "Saved history: unavailable (no project history alias could be issued)."
+            )
+    return ReadonlyBufferView(
+        id=ProjectLiveSessionBuffer.BUFFER_ID,
+        path="project-memory://live-sessions",
+        text="\n".join(lines) + "\n",
+    )
+
+
 class ProjectLiveSessionBuffer:
     """Observational, project-scoped instance discovery via ``AgentZooSessionDriver``."""
 
-    handles = (SessionReady, RenderRequested, TurnSettled, RunToolCall, IoCompleted, IoFailed)
+    handles = (
+        SessionReady,
+        SessionRestored,
+        RenderRequested,
+        TurnSettled,
+        RunToolCall,
+        IoCompleted,
+        IoFailed,
+        IoInterrupted,
+    )
     init = {"buffer_manager": BufferManager}
     reads = {"buffer_manager"}
-    optional_reads = {"_agent_zoo_context", "_session_id", "_local_state_root", "agent_db", "run_db"}
-    writes = {"buffer_manager", "_project_live_sessions_render"}
+    optional_reads = {"_agent_zoo_context", "_local_state_root"}
+    writes = {"buffer_manager"}
     BUFFER_ID = "live_sessions"
-    RENDER_ATTR = "_project_live_sessions_render"
     IO_TAG = "project_memory_live_sessions"
     REFRESH_S = 5.0
     MAX_IN_FLIGHT = 8
@@ -1187,17 +1880,19 @@ class ProjectLiveSessionBuffer:
         self.history = history
         self._explicit_clock = clock is not None
         self.clock = time.time if clock is None else clock
-        self._snapshots: dict[tuple[str, str], dict[str, Any]] = {}
-        self._pending_ops: dict[str, tuple[str, str]] = {}
 
     def bind_state(self, state: State) -> State:
         manager = getattr(state, "buffer_manager", None)
         if not isinstance(manager, BufferManager):
             manager = BufferManager()
             state.buffer_manager = manager
-        setattr(state, self.RENDER_ATTR, functools.partial(self.render, state))
+        rt = _runtime(state)
+        rt.live_clock = self.clock
+        rt.live_row_limit = self.ROW_LIMIT
+        if self.history is not None:
+            rt.history_enabled = True
         _register_exact_special_buffer(
-            manager, self.BUFFER_ID, operator.methodcaller(self.RENDER_ATTR)
+            manager, self.BUFFER_ID, _render_live_sessions_buffer
         )
         return state
 
@@ -1211,254 +1906,153 @@ class ProjectLiveSessionBuffer:
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         del emit
+        rt = _runtime(state)
+        rt.live_clock = self.clock
+        rt.live_row_limit = self.ROW_LIMIT
         if isinstance(event, IoCompleted):
-            self._handle_completed(event)
+            self._handle_completed(event, rt)
             return
         if isinstance(event, IoFailed):
-            self._handle_failed(event)
+            self._handle_failed(event, rt)
             return
+        if isinstance(event, IoInterrupted):
+            self._handle_interrupted(event, rt)
+            return
+        if isinstance(event, SessionRestored):
+            rt.live_pending_ops.clear()
+            for snap in rt.live_snapshots.values():
+                snap.update(pending=False, op_id=None, retry_at=None)
         self.bind_state(state)
-        self._maybe_request_discovery(state, self._throttle_ts(event))
+        self._maybe_request_discovery(state, rt, self._throttle_ts(event))
 
-    @staticmethod
-    def _context(state):
-        value = getattr(state, "_agent_zoo_context", {})
-        return value if isinstance(value, Mapping) else {}
-
-    @classmethod
-    def _local_state_root(cls, state) -> str:
-        context = cls._context(state)
-        value = (
-            context.get("local_state_root")
-            or getattr(state, "_local_state_root", "")
-            or getattr(state, "local_state_root", "")
-        )
-        return str(value or "").strip()
-
-    @classmethod
-    def _store_root(cls, state):
-        context = cls._context(state)
-        raw = context.get("project_store_root")
-        if not raw:
-            for name in ("agent_db", "run_db"):
-                db = getattr(state, name, None)
-                store = getattr(db, "store", db)
-                raw = getattr(store, "root", None)
-                if raw:
-                    break
-        if not raw:
-            project_dir = context.get("project_dir")
-            if not project_dir:
-                return None, "missing-context; no project coordination store is attached"
-            if not isinstance(project_dir, (str, os.PathLike)):
-                return None, "unavailable; invalid project directory context"
-            raw = Path(project_dir) / "coordination"
-        if not isinstance(raw, (str, os.PathLike)):
-            return None, "unavailable; invalid coordination store root"
-        root = Path(raw).expanduser()
-        if not root.is_absolute():
-            return None, "unavailable; coordination store root must be absolute (cwd is not authoritative)"
-        return Path(os.path.normpath(os.fspath(root))), ""
-
-    @staticmethod
-    def _new_snapshot() -> dict[str, Any]:
-        return dict(status="pending", rows=(), error="", pending=False,
-                    op_id=None, snapshot_at=None, attempt_at=None, retry_at=None)
-
-    def _maybe_request_discovery(self, state: State, throttle_ts: float) -> None:
-        context = self._context(state)
-        project = str(context.get("project_name") or "(unknown)")
-        root, _ = self._store_root(state)
+    def _maybe_request_discovery(
+        self,
+        state: State,
+        rt: ProjectMemoryRuntime,
+        throttle_ts: float,
+    ) -> None:
+        context = _context(state)
+        smeta = session_state(state)
+        project = str(context.get("project_name") or smeta.project_name or "(unknown)")
+        root, _ = _live_store_root(state)
         if root is None:
             return
         key = (project, os.fspath(root))
-        snapshot = self._snapshots.setdefault(key, self._new_snapshot())
+        snapshot = rt.live_snapshots.setdefault(key, _new_live_snapshot())
         io = getattr(state, "io", None)
         if io is None or not callable(getattr(io, "submit", None)):
-            snapshot.update(status="unsupported", error="runtime session discovery IO is unavailable")
+            snapshot.update(
+                status="unsupported",
+                error="runtime session discovery IO is unavailable",
+            )
             return
         is_active = getattr(io, "is_active", None)
         if callable(is_active):
-            for op_id, op_key in list(self._pending_ops.items()):
+            for op_id, op_key in list(rt.live_pending_ops.items()):
                 if not is_active(op_id):
-                    self._pending_ops.pop(op_id, None)
-                    snap = self._snapshots.get(op_key)
+                    rt.live_pending_ops.pop(op_id, None)
+                    snap = rt.live_snapshots.get(op_key)
                     if snap is not None and snap.get("op_id") == op_id:
                         snap.update(pending=False, op_id=None)
-        if snapshot["pending"] or (snapshot["retry_at"] is not None and throttle_ts < snapshot["retry_at"]):
+        if snapshot["pending"] or (
+            snapshot["retry_at"] is not None and throttle_ts < snapshot["retry_at"]
+        ):
             return
-        if len(self._pending_ops) >= self.MAX_IN_FLIGHT:
+        if len(rt.live_pending_ops) >= self.MAX_IN_FLIGHT:
             snapshot.update(status="busy", error="bounded discovery request limit reached")
             return
         op_id = io.submit(
             DiscoverSessions(
                 store_root=os.fspath(root),
-                local_state_root=self._local_state_root(state),
+                local_state_root=_local_state_root(state),
                 include_stale=True,
                 probe_local_processes=False,
             ),
             tag=self.IO_TAG,
         )
-        self._pending_ops[op_id] = key
+        rt.live_pending_ops[op_id] = key
         snapshot.update(pending=True, op_id=op_id, attempt_at=self.clock())
 
-    def _handle_completed(self, event: IoCompleted) -> None:
-        key = self._pending_ops.pop(event.op_id, None)
+    def _handle_completed(self, event: IoCompleted, rt: ProjectMemoryRuntime) -> None:
+        key = rt.live_pending_ops.pop(event.op_id, None)
         if key is None:
             return
-        snapshot = self._snapshots.setdefault(key, self._new_snapshot())
+        snapshot = rt.live_snapshots.setdefault(key, _new_live_snapshot())
         retry_at = self._throttle_ts(event) + self.REFRESH_S
         result = event.value
         if not isinstance(result, DiscoverSessionsResult):
-            snapshot.update(status="unavailable", error="invalid discovery result",
-                            pending=False, op_id=None, retry_at=retry_at)
+            snapshot.update(
+                status="unavailable",
+                error="invalid discovery result",
+                pending=False,
+                op_id=None,
+                retry_at=retry_at,
+            )
             return
         rows = tuple(result.rows or ())
         if not all(isinstance(row, LiveSessionInfo) for row in rows):
-            snapshot.update(status="unavailable", error="registry returned untyped records",
-                            pending=False, op_id=None, retry_at=retry_at)
+            snapshot.update(
+                status="unavailable",
+                error="registry returned untyped records",
+                pending=False,
+                op_id=None,
+                retry_at=retry_at,
+            )
             return
         status = str(result.status or "ready")
         error = _one_line_text(result.error, "") if result.error else ""
-        snapshot.update(status=status, error=error, pending=False, op_id=None, retry_at=retry_at)
+        snapshot.update(
+            status=status,
+            error=error,
+            pending=False,
+            op_id=None,
+            retry_at=retry_at,
+        )
         if status == "ready":
-            observed = (float(result.observed_at)
-                        if result.observed_at and result.observed_at > 0 else float(self.clock()))
+            observed = (
+                float(result.observed_at)
+                if result.observed_at and result.observed_at > 0
+                else float(self.clock())
+            )
             snapshot.update(rows=rows, snapshot_at=observed, error="")
 
-    def _handle_failed(self, event: IoFailed) -> None:
-        key = self._pending_ops.pop(event.op_id, None)
+    def _handle_failed(self, event: IoFailed, rt: ProjectMemoryRuntime) -> None:
+        key = rt.live_pending_ops.pop(event.op_id, None)
         if key is None:
             return
-        snapshot = self._snapshots.setdefault(key, self._new_snapshot())
-        # Exception messages can contain arbitrary persisted values or URLs.
-        error = (type(event.error).__name__ if isinstance(event.error, BaseException)
-                 else "TimeoutError" if event.timed_out else "discovery failed")
-        snapshot.update(status="unavailable", error=error, pending=False, op_id=None,
-                        retry_at=self._throttle_ts(event) + self.REFRESH_S)
+        snapshot = rt.live_snapshots.setdefault(key, _new_live_snapshot())
+        error = (
+            type(event.error).__name__
+            if isinstance(event.error, BaseException)
+            else "TimeoutError"
+            if event.timed_out
+            else "discovery failed"
+        )
+        snapshot.update(
+            status="unavailable",
+            error=error,
+            pending=False,
+            op_id=None,
+            retry_at=self._throttle_ts(event) + self.REFRESH_S,
+        )
 
-    @staticmethod
-    def _row_health(row: LiveSessionInfo, *, now: float) -> tuple[str, bool, bool]:
-        """Return ``(health, is_terminal, is_confirmed_stopped)`` evaluated at ``now``."""
-        if row.is_terminal or str(row.status or "").lower() in _LIVE_TERMINAL_STATUSES:
-            return "unknown", True, bool(row.is_confirmed_stopped)
-        has_obs = bool(row.observation_reason) or row.observed_at > 0.0
-        if (row.process_identity is None or not has_obs
-                or not math.isfinite(now) or not math.isfinite(row.observed_at)):
-            return "unknown", False, False
-        age = now - row.observed_at
-        if row.observed_at < 0 or age < 0:
-            return "unknown", False, False
-        pstate = str(row.process_state or "unknown").lower()
-        if pstate == "dead" or row.is_confirmed_stopped:
-            return "dead", False, True
-        return ("alive" if pstate == "alive" and age <= _LIVE_HEALTH_FRESHNESS_S else "unknown"), False, False
+    def _handle_interrupted(self, event: IoInterrupted, rt: ProjectMemoryRuntime) -> None:
+        key = rt.live_pending_ops.pop(event.op_id, None)
+        if key is None:
+            return
+        snapshot = rt.live_snapshots.get(key)
+        if snapshot is not None:
+            snapshot.update(pending=False, op_id=None, retry_at=None)
 
-    def render(self, state):
-        context = self._context(state)
-        project = str(context.get("project_name") or "(unknown)")
-        root, context_error = self._store_root(state)
-        now = self.clock()
-        lines = [
-            "Live Sessions", f"Project: {_one_line_text(project, '(unknown)')}",
-            f"Buffer Generated (UTC): {_format_utc(now)}",
-            f"Liveness Evaluated (UTC): {_format_utc(now)}",
-            "Observational registry only; no processes, sockets, or agents were contacted.",
-            "Lifecycle 'running' does not mean the model is working; no working/idle/completion inference.",
-            "Endpoints are advertised, not verified routes. Remote loopback addresses are not implied reachable.",
-            "Exact buffer reads are cached within a model step; health is as of the displayed evaluation time.",
-        ]
-        if root is None:
-            lines.append(f"Registry: {context_error}.")
-            return ReadonlyBufferView(id=self.BUFFER_ID, path="project-memory://live-sessions",
-                                      text="\n".join(lines) + "\n")
-        snapshot = self._snapshots.get((project, os.fspath(root))) or self._new_snapshot()
-        status = snapshot["status"]
-        has_snapshot = snapshot["snapshot_at"] is not None
-        lines.append(f"Coordination Store: {root}")
-        if snapshot["pending"] or (status == "pending" and not has_snapshot):
-            lines.append("Registry: refresh pending; last-good snapshot retained (stale)." if has_snapshot
-                         else "Registry: pending; initial background read has not completed.")
-        elif status == "ready":
-            lines.append("Registry: ready." if snapshot["rows"] else "Registry: empty (successful read; zero instances).")
-        else:
-            lines.append(f"Registry: {status}; {snapshot['error']}.")
-            if has_snapshot:
-                lines.append("Last-good snapshot retained (stale); this is not a new registry observation.")
-            else:
-                lines.append("No successful registry snapshot; this is not a known-empty registry.")
-        lines.extend([
-            f"Registry Read (UTC; last successful): {_format_utc(snapshot['snapshot_at'])}",
-            f"Refresh Requested (UTC): {_format_utc(snapshot['attempt_at'])}",
-        ])
-        if not has_snapshot:
-            return ReadonlyBufferView(id=self.BUFFER_ID, path="project-memory://live-sessions",
-                                      text="\n".join(lines) + "\n")
-        active = []
-        terminal = stopped = 0
-        for row in snapshot["rows"]:
-            health, is_terminal, is_stopped = self._row_health(row, now=now)
-            if is_terminal:
-                terminal += 1
-            elif is_stopped:
-                stopped += 1
-            else:
-                active.append((row, health))
-        active.sort(key=lambda item: (item[0].session_id, item[0].instance_id))
-        alive = sum(health == "alive" for _, health in active)
-        lines.extend([
-            f"Registry Instances: {len(snapshot['rows'])}",
-            f"Active candidates: {len(active)}; confirmed alive: {alive}; unknown: {len(active) - alive}",
-            f"Excluded: {terminal} terminal lifecycle; {stopped} other confirmed-stopped instances.",
-            f"Rows shown: {min(len(active), self.ROW_LIMIT)} of {len(active)} active candidates; "
-            f"truncated: {max(0, len(active) - self.ROW_LIMIT)}.",
-            "Order: session ID, then instance ID. Current and child/RLM sessions are included.",
-        ])
-        shown = active[:self.ROW_LIMIT]
-        aliases = {}
-        if self.history is not None:
-            identities = {}
-            for row, _ in shown:
-                identities.setdefault(row.session_id, dict(
-                    session_id=row.session_id, title=row.title, description=row.description,
-                    kind=row.kind, updated_at=row.updated_at, created_at=row.started_at,
-                ))
-            aliases = self.history.issue_sessions(state, list(identities.values()))
-            lines.append(
-                "History links select a saved session continuation, NOT necessarily this runtime instance. "
-                "Check Source Instance/Commit; unsaved activity is absent. First-observation pins last until backend restart."
-            )
-        else:
-            lines.append("History: disabled; no transcript links registered.")
-        current = str(getattr(state, "_session_id", "") or context.get("session_id") or "")
-        for row, health in shown:
-            has_obs = bool(row.observation_reason) or row.observed_at > 0.0
-            age = f"{now - row.observed_at:.1f}s" if has_obs else "(unknown)"
-            endpoint = _one_line_text(
-                sanitize_ws_url(row.websocket_url),
-                "(unavailable: malformed advertised endpoint)",
-            )
-            lines.extend([
-                "", f"## Instance: {_one_line_text(row.instance_id, '(unknown)')}",
-                f"Session ID: {_one_line_text(row.session_id, '(unknown)')}",
-                f"Current session: {'yes' if row.session_id == current else 'no'} (session identity, not process identity)",
-                f"Title: {_one_line_text(row.title, '(none)')}",
-                f"Description: {_one_line_text(row.description, '(none)')}",
-                f"Kind: {_one_line_text(row.kind, '(unknown)')}",
-                f"Child/RLM: {'yes' if row.kind.lower().startswith('rlm') else 'not indicated'}",
-                f"Hostname: {_one_line_text(row.hostname, '(unknown)')}; PID: {row.pid}",
-                f"Lifecycle status: {_one_line_text(row.status, '(unknown)')}; process state: {health}",
-                f"Observation (UTC): {_format_utc(row.observed_at if has_obs else None)}; age: {age}",
-                f"Observation reason: {_one_line_text(row.observation_reason, '(not recorded)')}",
-                f"Metadata Updated (UTC): {_format_utc(row.updated_at)}",
-                f"Websocket endpoint: {endpoint}",
-            ])
-            if self.history is not None:
-                alias = aliases.get(row.session_id)
-                lines.append(f"Saved history: {alias} | {alias}_full (availability checked on open)" if alias
-                             else "Saved history: unavailable (no project history alias could be issued).")
-        return ReadonlyBufferView(id=self.BUFFER_ID, path="project-memory://live-sessions",
-                                  text="\n".join(lines) + "\n")
+    def render(self, state: State) -> ReadonlyBufferView:
+        rt = _runtime(state)
+        rt.live_clock = self.clock
+        rt.live_row_limit = self.ROW_LIMIT
+        return _render_live_sessions_buffer(
+            state,
+            history_hook=self.history,
+            row_limit_override=self.ROW_LIMIT,
+        )
 
 
 class ProjectMemorySystemPrompt(RenderTransformRegistrar):
@@ -1540,7 +2134,7 @@ class ProjectMemorySystemPrompt(RenderTransformRegistrar):
             loaded = yaml.safe_load(cls._config_path().read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
-        except (OSError, yaml.YAMLError):
+        except (OSError, UnicodeError, yaml.YAMLError):
             log.warning("Could not load project-memory config", exc_info=True)
             return {}
         return loaded if isinstance(loaded, dict) else {}
@@ -1550,17 +2144,15 @@ class ProjectMemorySystemPrompt(RenderTransformRegistrar):
         override = str(os.environ.get(CONFIG_PATH_ENV, "") or "").strip()
         if override:
             return Path(override).expanduser()
-        return cls._state_root() / "plugin-configs" / PLUGIN_NAME / "config" / CONFIG_FILENAME
+        return PluginStorage(
+            PLUGIN_NAME,
+            config_format="yaml",
+            config_filename=CONFIG_REL_PATH,
+        ).config.path
 
     @staticmethod
     def _state_root() -> Path:
-        for name in ("AGENT_ZOO_HOME", "AGENT_ZOO_STATE_ROOT", "AGENT_ZOO_INSTALL_ROOT"):
-            value = str(os.environ.get(name, "") or "").strip()
-            if value:
-                return Path(value).expanduser()
-        xdg = str(os.environ.get("XDG_DATA_HOME", "") or "").strip()
-        base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
-        return base / "agent-zoo"
+        return resolve_state_root()
 
 
 def _subfeature_enabled(section: Mapping[str, Any], name: str) -> bool:
@@ -1570,73 +2162,111 @@ def _subfeature_enabled(section: Mapping[str, Any], name: str) -> bool:
     return _config_enabled(value)
 
 
-def _read_settings_config(path: Path) -> dict[str, Any]:
-    try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, UnicodeError, yaml.YAMLError):
-        raise SettingError("Cannot read project-memory settings") from None
-    if not isinstance(document, dict) or not isinstance(document.get(CONFIG_SECTION, {}), dict):
-        raise SettingError("Project-memory settings must contain YAML mappings")
-    return document
+class _SettingsBox:
+    """Pure in-memory container for project-memory settings loaded once at build time."""
 
+    def __init__(
+        self,
+        document: dict[str, Any],
+        *,
+        load_error: str | None = None,
+    ) -> None:
+        self.document: dict[str, Any] = copy.deepcopy(document)
+        self.load_error: str | None = load_error
 
-def _write_setting(name: str, value: bool) -> None:
-    if type(value) is not bool:
-        raise SettingError("Project-memory settings require a boolean")
-    temporary = None
-    try:
-        path = ProjectMemorySystemPrompt._config_path().resolve()
-        document = _read_settings_config(path)
-        section = dict(document.get(CONFIG_SECTION, {}))
+    def get_value(self, name: str) -> bool:
+        if self.load_error is not None:
+            raise SettingError(self.load_error)
+        section = dict(self.document.get(CONFIG_SECTION, {}))
+        return (
+            _config_enabled(section.get(name, True))
+            if name == "enabled"
+            else _subfeature_enabled(section, name)
+        )
+
+    def set_value(self, name: str, value: Any, ctx: Any) -> None:
+        if type(value) is not bool:
+            raise SettingError("Project-memory settings require a boolean")
+        if self.load_error is not None:
+            raise SettingError(self.load_error)
+        previous = copy.deepcopy(self.document)
+        section = dict(self.document.get(CONFIG_SECTION, {}))
         if name == "enabled":
             section[name] = value
         else:
             existing = section.get(name, {})
             if not isinstance(existing, (dict, bool, str)):
                 raise SettingError("Invalid project-memory subfeature settings")
-            section[name] = {**existing, "enabled": value} if isinstance(existing, dict) else value
-        document[CONFIG_SECTION] = section
-        text = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix=f".{path.name}.", delete=False) as stream:
-            temporary = Path(stream.name)
-            os.fchmod(stream.fileno(), mode)
-            stream.write(text)
-        os.replace(temporary, path)
-    except (OSError, UnicodeError, yaml.YAMLError):
-        raise SettingError("Cannot save project-memory settings") from None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            section[name] = (
+                {**existing, "enabled": value} if isinstance(existing, dict) else value
+            )
+        self.document[CONFIG_SECTION] = section
+        updated = copy.deepcopy(self.document)
+
+        def _rollback() -> None:
+            self.document = previous
+
+        if ctx is not None and callable(getattr(ctx, "submit_persist_io", None)):
+            ctx.submit_persist_io(
+                StoreUpdate(
+                    plugin=PLUGIN_NAME,
+                    scope="config",
+                    config_filename=CONFIG_REL_PATH,
+                    value=updated,
+                ),
+                rollback=_rollback,
+            )
+
+
+def _load_settings_box() -> _SettingsBox:
+    """Build-time YAML loader populating an in-memory ``_SettingsBox``."""
+    path = ProjectMemorySystemPrompt._config_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _SettingsBox({})
+    except (OSError, UnicodeError):
+        return _SettingsBox({}, load_error="Cannot read project-memory settings")
+    try:
+        document = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return _SettingsBox({}, load_error="Cannot read project-memory settings")
+    if not isinstance(document, dict) or not isinstance(document.get(CONFIG_SECTION, {}), dict):
+        return _SettingsBox(
+            {},
+            load_error="Project-memory settings must contain YAML mappings",
+        )
+    return _SettingsBox(document)
 
 
 def _settings(config: Any) -> list[Setting]:
     explicit = (config or {}).get(CONFIG_SECTION, {})
     explicit = dict(explicit) if isinstance(explicit, Mapping) else {}
+    box = _load_settings_box()
 
-    def read(name):
-        section = dict(_read_settings_config(ProjectMemorySystemPrompt._config_path())
-                       .get(CONFIG_SECTION, {}))
-        return (_config_enabled(section.get(name, True)) if name == "enabled"
-                else _subfeature_enabled(section, name))
-
-    settings = []
-    for name, label in (("enabled", "Enabled"), ("project_sessions", "Session history"),
-                        ("live_sessions", "Live-session discovery")):
+    settings: list[Setting] = []
+    for name, label in (
+        ("enabled", "Enabled"),
+        ("project_sessions", "Session history"),
+        ("live_sessions", "Live-session discovery"),
+    ):
         overridden = name in explicit
         key = name if name == "enabled" else f"{name}.enabled"
-        settings.append(Setting(
-            key=f"project_memory.{key}", label=label, kind="bool",
-            get=lambda ctx, name=name: read(name),
-            set=lambda ctx, value, name=name: _write_setting(name, value),
-            group="Project memory", apply="reload",
-            help=("Saved default; reload the backend to apply changes."
-                  + (" A launch override takes precedence in this backend." if overridden else "")),
-        ))
+        settings.append(
+            Setting(
+                key=f"project_memory.{key}",
+                label=label,
+                kind="bool",
+                get=lambda ctx, _box=box, name=name: _box.get_value(name),
+                set=lambda ctx, value, _box=box, name=name: _box.set_value(name, value, ctx),
+                group="Project memory",
+                apply="reload",
+                help=(
+                    "Saved default; reload the backend to apply changes."
+                    + (" A launch override takes precedence in this backend." if overridden else "")
+                ),
+            )
+        )
     return settings
 
 
@@ -1663,11 +2293,13 @@ def register_features(builder, *, session, config):
     prompt = str(section.get("system_prompt", default_prompt) or "").strip()
 
     components = []
+    drivers = []
     order = [IoFence, RegisterSpecialBuffers]
     history = ProjectSessionBuffers() if sessions_enabled else None
     if history is not None:
         components.append(history)
         order.append(ProjectSessionBuffers)
+        drivers.append(ProjectHistoryDriver)
     if live_enabled:
         components.append(ProjectLiveSessionBuffer(history=history))
         order.append(ProjectLiveSessionBuffer)
@@ -1688,5 +2320,6 @@ def register_features(builder, *, session, config):
             name="project_memory",
             components=components,
             order=order,
+            drivers=drivers,
         )
     )

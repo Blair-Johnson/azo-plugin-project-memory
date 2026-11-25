@@ -10,6 +10,7 @@ from agent_zoo import pipelines
 from agent_zoo.features.modes import default_modes, rlm_modes
 from agent_zoo.features.settings import Setting, SettingsContext, SettingsRegistry
 from agent_zoo.plugins import loader as plugin_loader
+from agent_zoo.testing.sans_io_guard import assert_pipeline_sans_io, audit_module_sans_io
 
 import project_memory as pm
 
@@ -64,6 +65,7 @@ def test_feature_contains_history_and_live_buffers(monkeypatch):
         pm.ProjectLiveSessionBuffer,
         pm.ProjectMemorySystemPrompt,
     }
+    assert pm.ProjectHistoryDriver in features[-1].drivers
 
 
 def _install_only_project_memory(builder, *, session, config, **_kwargs):
@@ -98,6 +100,7 @@ def test_real_harness_pipelines_build_with_project_memory(builder, modes, monkey
     assert pm.ProjectSessionBuffers in types
     assert pm.ProjectLiveSessionBuffer in types
     assert pm.ProjectMemorySystemPrompt in types
+    assert_pipeline_sans_io(pipeline)
     registry = SettingsRegistry([component for component in pipeline if isinstance(component, Setting)])
     catalog = registry.handle(
         {"type": "plugin_settings", "request_id": "test", "action": "list"},

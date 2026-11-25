@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested, TurnSettled
+from agent_utils.core.events import IoCompleted, IoFailed, IoInterrupted, RenderRequested, SessionRestored, TurnSettled
 from agent_utils.core.io import SubmitOp
 from agent_utils.core.pipeline import Pipeline
 from agent_utils.core.session import Session
@@ -17,6 +17,7 @@ from agent_utils.core.state import State
 from agent_utils.features.buffers import BufferManager
 from agent_utils.features.core import IoFence
 from agent_utils.runtime.simulation import SimulationRuntime
+from agent_zoo.core.feature_state import session_state
 from agent_zoo.drivers.sessions import (
     AgentZooSessionDriver,
     SimSessionDriver,
@@ -49,7 +50,8 @@ def private_environment(tmp_path, monkeypatch):
 def state(root):
     observer = State(token_budget=10000)
     observer.step = 1
-    observer._session_id = CURRENT
+    session_state(observer).session_id = CURRENT
+    session_state(observer).project_name = "demo"
     observer.buffer_manager = BufferManager()
     observer._agent_zoo_context = dict(project_name="demo", project_dir=str(root))
     return observer
@@ -209,26 +211,23 @@ def test_authoritative_context_override_and_attached_store_roots(tmp_path):
     override = tmp_path / "override"
     observer._agent_zoo_context["project_store_root"] = str(override)
     observer._agent_zoo_context["local_state_root"] = str(tmp_path / "local-root")
-    observer.agent_db = SimpleNamespace(store=SimpleNamespace(root=tmp_path / "wrong"))
     refresh()
     assert requests[-1].store_root == str(override)
     assert requests[-1].local_state_root == str(tmp_path / "local-root")
-    assert all(req.store_root != str(tmp_path / "wrong") for req in requests)
     assert "Registry: empty" in component.render(observer).text
 
     del observer._agent_zoo_context["project_store_root"]
-    attached = tmp_path / "attached"
-    observer.agent_db.store.root = attached
+    other_project = tmp_path / "other-project"
+    observer._agent_zoo_context["project_dir"] = str(other_project)
     refresh()
-    assert requests[-1].store_root == str(attached)
+    assert requests[-1].store_root == str(other_project / "coordination")
     assert "Registry: empty" in component.render(observer).text
 
     observer._agent_zoo_context["project_store_root"] = "relative/path"
     text = component.render(observer).text
     assert "must be absolute" in text
-    assert not (tmp_path / "wrong").exists()
     assert not override.exists()
-    assert not attached.exists()
+    assert not other_project.exists()
 
 
 def test_missing_context_absent_empty_unavailable_and_unsupported_are_distinct(tmp_path):
@@ -458,8 +457,16 @@ def test_in_flight_limit_is_bounded_and_projects_do_not_share_snapshots(tmp_path
         text = component.render(observer).text
         assert "No successful registry snapshot" in text or "Registry: pending" in text
     assert "Registry: busy" in text
-    assert len(component._pending_ops) == component.MAX_IN_FLIGHT
-    assert sum(s["pending"] for s in component._snapshots.values()) == component.MAX_IN_FLIGHT
+    rt = pm._runtime(observer)
+    assert len(rt.live_pending_ops) == component.MAX_IN_FLIGHT
+    assert sum(s["pending"] for s in rt.live_snapshots.values()) == component.MAX_IN_FLIGHT
+
+    # IoInterrupted and SessionRestored clear pending ops cleanly so discovery can resume.
+    first_op = next(iter(rt.live_pending_ops))
+    component.handle(IoInterrupted(op_id=first_op, reason="quiesce"), observer, lambda _ev: None)
+    assert first_op not in rt.live_pending_ops
+    component.handle(SessionRestored(ts=101.0), observer, lambda _ev: None)
+    assert len(rt.live_pending_ops) == 1
 
 
 def test_corrupt_live_record_is_not_an_empty_registry(tmp_path):
