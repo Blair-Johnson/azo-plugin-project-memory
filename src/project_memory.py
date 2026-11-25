@@ -2203,3 +2203,212 @@ def register_features(builder, *, config):
             drivers=drivers,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Simulation Testing (DST) Hooks
+# ---------------------------------------------------------------------------
+
+
+def register_sim_handlers(sim: Any, rng: Any) -> None:
+    """Register deterministic in-memory simulation handlers for project memory IO."""
+    from agent_utils.runtime.simulation import SimOutcome
+
+    sim_epoch = 1_700_000_000.0
+
+    def _sim_catalog_rows(current_session_id: str) -> tuple[dict[str, Any], ...]:
+        raw = [
+            {
+                "session_id": "simhist01aabbcc",
+                "title": "Prior architecture review",
+                "description": "Simulated prior session 1",
+                "kind": "default",
+                "created_at": sim_epoch,
+                "updated_at": sim_epoch + 120.0,
+            },
+            {
+                "session_id": "simhist02ddeeff",
+                "title": "Follow-up debugging notes",
+                "description": "Simulated prior session 2",
+                "kind": "default",
+                "created_at": sim_epoch + 60.0,
+                "updated_at": sim_epoch + 240.0,
+            },
+        ]
+        return tuple(_eligible_project_sessions(raw, current_session_id))
+
+    def _handle_load_catalog(
+        _op_id: OpId,
+        req: LoadProjectCatalogRequest,
+        _sim: Any,
+    ) -> SimOutcome:
+        import sys as _sys
+
+        delay = rng.uniform(0.01, 0.05)
+        req_mod = _sys.modules.get(type(req).__module__)
+        cat_result_cls = getattr(req_mod, "ProjectCatalogResult", ProjectCatalogResult)
+        roll = rng.random()
+        if roll < 0.05:
+            return SimOutcome(error=OSError("simulated project catalog read failure"), delay=delay)
+        if roll < 0.13:
+            return SimOutcome(
+                value=cat_result_cls(
+                    project_name=req.project_name,
+                    project_dir=req.project_dir,
+                    status="absent",
+                    sessions=(),
+                    error="",
+                ),
+                delay=delay,
+            )
+        if roll < 0.18:
+            return SimOutcome(
+                value=cat_result_cls(
+                    project_name=req.project_name,
+                    project_dir=req.project_dir,
+                    status="unavailable",
+                    sessions=(),
+                    error="simulated catalog unavailable",
+                ),
+                delay=delay,
+            )
+        return SimOutcome(
+            value=cat_result_cls(
+                project_name=req.project_name,
+                project_dir=req.project_dir,
+                status="ready",
+                sessions=_sim_catalog_rows(req.current_session_id),
+                error="",
+            ),
+            delay=delay,
+        )
+
+    def _handle_load_session(
+        _op_id: OpId,
+        req: LoadProjectSessionRequest,
+        _sim: Any,
+    ) -> SimOutcome:
+        import sys as _sys
+
+        delay = rng.uniform(0.01, 0.06)
+        if rng.random() < 0.06:
+            return SimOutcome(
+                error=RuntimeError("simulated saved session history read failure"),
+                delay=delay,
+            )
+        req_mod = _sys.modules.get(type(req).__module__)
+        sess_result_cls = getattr(req_mod, "ProjectSessionResult", ProjectSessionResult)
+        session_meta = dict(req.session or {})
+        sid = str(session_meta.get("session_id") or f"{req.alias}_session")
+        session_meta["session_id"] = sid
+        commit_id = req.commit_id or f"commit-{req.alias}-1"
+        instance_id = req.instance_id or f"inst-{req.alias}"
+        source_format = req.source_format or "journal"
+        generated_at = req.generated_at if req.commit_id is not None else (sim_epoch + float(_sim.now))
+        receipt = req.receipt or (
+            "Session source: simulated.\n"
+            "Source Repository: sim://project-memory\n"
+            "Saved history only; unsaved runtime activity is not included."
+        )
+        synthetic_doc = {
+            "entries": [
+                {
+                    "index": 0,
+                    "step": 1,
+                    "messages": [
+                        {"role": "user", "content": f"Simulated prompt for {sid}"},
+                        {"role": "assistant", "content": f"Simulated response for {sid}"},
+                    ],
+                }
+            ]
+        }
+        formatter = _build_full_transcript if req.full else _build_compact_transcript
+        navigation = (
+            f"View: {'full' if req.full else 'compact'}\n"
+            f"Compact buffer: {req.alias}\nFull buffer: {req.alias}_full"
+        )
+        text = (
+            receipt
+            + "\n"
+            + navigation
+            + "\n\n"
+            + formatter(
+                session_meta,
+                synthetic_doc,
+                commit_id=commit_id,
+                instance_id=instance_id,
+                source_format=source_format,
+                generated_at=generated_at,
+            )
+        )
+        return SimOutcome(
+            value=sess_result_cls(
+                project_name=req.project_name,
+                project_dir=req.project_dir,
+                alias=req.alias,
+                full=req.full,
+                commit_id=commit_id,
+                instance_id=instance_id,
+                source_format=source_format,
+                generated_at=generated_at,
+                receipt=receipt,
+                text=text,
+            ),
+            delay=delay,
+        )
+
+    import sys as _sys
+
+    sim.register_handler(LoadProjectCatalogRequest, _handle_load_catalog)
+    sim.register_handler(LoadProjectSessionRequest, _handle_load_session)
+    live_mod = _sys.modules.get(__name__)
+    for req_name, handler in (
+        ("LoadProjectCatalogRequest", _handle_load_catalog),
+        ("LoadProjectSessionRequest", _handle_load_session),
+    ):
+        cls = getattr(live_mod, req_name, None)
+        if isinstance(cls, type):
+            sim.register_handler(cls, handler)
+
+
+def fuzz_tool_args(tool_name: str, rng: Any, state: State) -> dict[str, Any] | None:
+    """Provide deterministic state-aware special-buffer targets for project memory views."""
+    if tool_name not in ("view", "grep"):
+        return None
+    rt = state.runtime("project_memory") if callable(getattr(state, "runtime", None)) else None
+    if not (isinstance(rt, ProjectMemoryRuntime) or type(rt).__name__ == "ProjectMemoryRuntime"):
+        return None
+    candidates = [PROJECT_SESSIONS_BUFFER_ID, ProjectLiveSessionBuffer.BUFFER_ID]
+    for _proj, alias in sorted(rt.pins.keys()):
+        candidates.append(alias)
+        candidates.append(f"{alias}_full")
+    chosen = candidates[rng.randrange(len(candidates))]
+    if tool_name == "view":
+        return {"buffer": chosen, "line_ranges": rng.choice(["", "1:20"])}
+    return {"buffer": chosen, "pattern": rng.choice(["Session", "Title", "Instance"])}
+
+
+def check_invariants(session: Any) -> None:
+    """Verify structural invariants on project-memory runtime caches and in-flight tracking."""
+    state = session.state
+    rt = state.runtime("project_memory") if callable(getattr(state, "runtime", None)) else None
+    if not (isinstance(rt, ProjectMemoryRuntime) or type(rt).__name__ == "ProjectMemoryRuntime"):
+        return
+    assert rt.text_bytes >= 0, f"negative text_bytes: {rt.text_bytes}"
+    assert rt.text_bytes <= SESSION_PROJECTION_CACHE_BYTES, (
+        f"text_bytes exceeded cache cap: {rt.text_bytes} > {SESSION_PROJECTION_CACHE_BYTES}"
+    )
+    actual_bytes = sum(sz for _, sz in rt.texts.values())
+    assert rt.text_bytes == actual_bytes, (
+        f"text_bytes accounting drift: {rt.text_bytes} != {actual_bytes}"
+    )
+    assert len(rt.pending_catalog_ops) <= SESSION_LOAD_QUEUE_LIMIT
+    assert len(rt.session_requests) <= SESSION_LOAD_QUEUE_LIMIT
+    assert len(rt.live_pending_ops) <= ProjectLiveSessionBuffer.MAX_IN_FLIGHT
+    for op_id, key in rt.pending_catalog_ops.items():
+        assert isinstance(op_id, str) and op_id
+        assert key in rt.inventories, f"pending catalog op {op_id!r} references missing inventory {key!r}"
+    for scope, pin in rt.pins.items():
+        assert isinstance(scope, tuple) and len(scope) == 2
+        assert isinstance(pin, dict) and isinstance(pin.get("session"), dict)
+        assert bool(pin["session"].get("session_id")), f"pin {scope!r} missing session_id"
