@@ -164,3 +164,56 @@ def test_config_template_preserves_detailed_session_guidance(monkeypatch):
         assert guidance in prompt
     for removed_tool in ("record_memory", "update_memory", "suppress_memory", "delete_memory"):
         assert removed_tool not in prompt
+
+
+def test_session_restored_holds_readiness_until_hydration_completes(tmp_path):
+    from agent_utils.core.events import IoCompleted, SessionRestored
+    from agent_utils.core.io import SubmitOp
+    from agent_utils.core.pipeline import PipelineBuilder
+    from agent_utils.features.core import core_feature
+    from agent_zoo.events import DiscoverSessions, DiscoverSessionsResult
+
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    session = Session()
+    builder = PipelineBuilder().add(core_feature())
+    pm.register_features(builder, session=session, config={"project_memory": {"enabled": True}})
+    session.pipeline = builder.build(suppress_warnings=True)
+    session.ensure_initialized()
+    session.state._agent_zoo_context = {
+        "project_name": "demo",
+        "project_dir": str(project_dir),
+        "project_store_root": str(project_dir / "coordination"),
+    }
+
+    effects = session.step(SessionRestored(reason="resume"))
+    cat_eff = next(
+        e for e in effects if isinstance(e, SubmitOp) and isinstance(e.request, pm.LoadProjectCatalogRequest)
+    )
+    live_eff = next(
+        e for e in effects if isinstance(e, SubmitOp) and isinstance(e.request, DiscoverSessions)
+    )
+    assert not session.state.readiness.is_ready
+    assert any(k.startswith("project_memory:") for k in session.state.readiness.holds)
+
+    session.step(
+        IoCompleted(
+            op_id=cat_eff.op_id,
+            value=pm.ProjectCatalogResult(
+                project_name="demo",
+                project_dir=str(project_dir),
+                status="absent",
+                sessions=(),
+                error="",
+            ),
+        )
+    )
+    assert not session.state.readiness.is_ready
+
+    session.step(
+        IoCompleted(
+            op_id=live_eff.op_id,
+            value=DiscoverSessionsResult(status="ready", rows=(), observed_at=1.0),
+        )
+    )
+    assert session.state.readiness.is_ready

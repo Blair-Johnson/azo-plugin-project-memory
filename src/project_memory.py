@@ -1193,6 +1193,7 @@ def _request_inventory_io(
     current_session_id: str,
     *,
     now: float | None = None,
+    hold_readiness: str | bool | None = None,
 ) -> str:
     rt = _runtime(state)
     _reconcile_active_ops(state, rt)
@@ -1220,6 +1221,7 @@ def _request_inventory_io(
             current_session_id=current_session_id,
         ),
         tag="project_memory_catalog",
+        hold_readiness=hold_readiness,
     )
     rt.pending_catalog_ops[op_id] = key
     record.update(pending=True, op_id=op_id)
@@ -1504,7 +1506,8 @@ class ProjectSessionBuffers:
             self._handle_interrupted(event, rt)
             return
 
-        if isinstance(event, SessionRestored):
+        is_restore = isinstance(event, SessionRestored)
+        if is_restore:
             # Previous process IO ops cannot complete after restore; clear pending markers.
             rt.pending_catalog_ops.clear()
             rt.pending_session_ops.clear()
@@ -1516,7 +1519,13 @@ class ProjectSessionBuffers:
         self.bind_state(state)
         project_name, project_dir, current_session_id = _history_runtime_context(state)
         if project_dir is not None:
-            _request_inventory_io(state, project_name, project_dir, current_session_id)
+            _request_inventory_io(
+                state,
+                project_name,
+                project_dir,
+                current_session_id,
+                hold_readiness="project_memory" if is_restore else None,
+            )
 
     def _handle_completed(self, event: IoCompleted, rt: ProjectMemoryRuntime) -> None:
         cat_key = rt.pending_catalog_ops.pop(event.op_id, None)
@@ -1918,18 +1927,26 @@ class ProjectLiveSessionBuffer:
         if isinstance(event, IoInterrupted):
             self._handle_interrupted(event, rt)
             return
-        if isinstance(event, SessionRestored):
+        is_restore = isinstance(event, SessionRestored)
+        if is_restore:
             rt.live_pending_ops.clear()
             for snap in rt.live_snapshots.values():
                 snap.update(pending=False, op_id=None, retry_at=None)
         self.bind_state(state)
-        self._maybe_request_discovery(state, rt, self._throttle_ts(event))
+        self._maybe_request_discovery(
+            state,
+            rt,
+            self._throttle_ts(event),
+            hold_readiness="project_memory" if is_restore else None,
+        )
 
     def _maybe_request_discovery(
         self,
         state: State,
         rt: ProjectMemoryRuntime,
         throttle_ts: float,
+        *,
+        hold_readiness: str | bool | None = None,
     ) -> None:
         context = _context(state)
         smeta = session_state(state)
@@ -1969,6 +1986,7 @@ class ProjectLiveSessionBuffer:
                 probe_local_processes=False,
             ),
             tag=self.IO_TAG,
+            hold_readiness=hold_readiness,
         )
         rt.live_pending_ops[op_id] = key
         snapshot.update(pending=True, op_id=op_id, attempt_at=self.clock())
