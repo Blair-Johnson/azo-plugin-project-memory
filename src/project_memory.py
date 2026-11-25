@@ -8,11 +8,9 @@ import logging
 import math
 import os
 import re
-import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,10 +42,14 @@ from agent_utils.features.core import (
     RenderTransformRegistrar,
     ToolRunner,
 )
-from agent_utils.runtime.driver import Driver
-from agent_zoo.core.feature_state import session_state
 from agent_zoo.drivers.sessions import sanitize_ws_url
-from agent_zoo.durability import PluginStorage, StoreUpdate
+from agent_zoo.durability import (
+    PluginStorage,
+    StoreUpdate,
+    ThreadPoolDriver,
+    session_context,
+    session_state,
+)
 from agent_zoo.events import (
     DiscoverSessions,
     DiscoverSessionsResult,
@@ -57,7 +59,6 @@ from agent_zoo.events import (
 from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.special_buffers import RegisterSpecialBuffers
 from agent_zoo.features.system_prompt import SystemPromptSkillList
-from agent_zoo.storage.projects import resolve_state_root
 
 
 log = logging.getLogger("agent_zoo_user_plugin.project_memory")
@@ -771,11 +772,14 @@ class ProjectSessionResult:
     text: str
 
 
-class ProjectHistoryDriver(Driver):
+class ProjectHistoryDriver(ThreadPoolDriver):
     """Ephemeral IO driver executing project catalog & saved-session projection reads."""
 
     durability = "ephemeral"
     request_types = (LoadProjectCatalogRequest, LoadProjectSessionRequest)
+    max_workers = 4
+    worker_prefix = "azo-project-history"
+    interrupt_on_quiesce = True
 
     def __init__(
         self,
@@ -784,52 +788,9 @@ class ProjectHistoryDriver(Driver):
         clock: Callable[[], float] = time.time,
         load_wait_timeout_s: float = 10.0,
     ) -> None:
-        super().__init__()
-        self._max_workers = max(1, int(max_workers))
+        super().__init__(max_workers=max_workers)
         self._clock = clock
         self._load_wait_timeout_s = max(0.05, float(load_wait_timeout_s))
-        self._lock = threading.Lock()
-        self._executor: ThreadPoolExecutor | None = None
-        self._futures: dict[OpId, Future[Any]] = {}
-        self._in_flight: dict[OpId, IoRequest] = {}
-        self._cancelled: set[OpId] = set()
-        self._closed = False
-
-    def start(self, emit: EmitFn) -> None:
-        super().start(emit)
-        with self._lock:
-            self._closed = False
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=self._max_workers,
-                    thread_name_prefix="azo-project-history",
-                )
-
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
-        if not isinstance(req, self.request_types):
-            raise TypeError(
-                f"ProjectHistoryDriver expected LoadProjectCatalogRequest or "
-                f"LoadProjectSessionRequest, got {type(req).__name__}"
-            )
-        with self._lock:
-            if self._closed or op_id in self._cancelled:
-                return
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(
-                    max_workers=self._max_workers,
-                    thread_name_prefix="azo-project-history",
-                )
-            fut = self._executor.submit(self._execute, op_id, req)
-            self._futures[op_id] = fut
-            self._in_flight[op_id] = req
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._lock:
-            self._cancelled.add(op_id)
-            fut = self._futures.get(op_id)
-            self._in_flight.pop(op_id, None)
-        if fut is not None:
-            fut.cancel()
 
     def quiesce(
         self,
@@ -837,37 +798,10 @@ class ProjectHistoryDriver(Driver):
         policy: str = "terminate",
         deadline: float | None = None,
     ) -> list[Event]:
-        del deadline
-        with self._lock:
-            in_flight = list(self._in_flight.keys())
-            futures = list(self._futures.values())
-            self._cancelled.update(in_flight)
-            self._in_flight.clear()
-            self._futures.clear()
-        for fut in futures:
-            fut.cancel()
-        reason = f"quiesce:{policy}"
-        return [IoInterrupted(op_id=op_id, reason=reason) for op_id in in_flight]
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            futures = list(self._futures.values())
-            self._cancelled.update(self._futures.keys())
-            self._futures.clear()
-            self._in_flight.clear()
-            executor = self._executor
-            self._executor = None
-        for fut in futures:
-            fut.cancel()
-        if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
-        with self._lock:
-            self._cancelled.clear()
-
-    def _is_fenced(self, op_id: OpId) -> bool:
-        with self._lock:
-            return self._closed or op_id in self._cancelled
+        return super().quiesce(
+            policy=policy,
+            deadline=time.monotonic() if deadline is None else deadline,
+        )
 
     @staticmethod
     def _read_catalog_snapshot(project_name: str, project_dir: Path):
@@ -886,27 +820,12 @@ class ProjectHistoryDriver(Driver):
             "present",
         )
 
-    def _execute(self, op_id: OpId, req: IoRequest) -> None:
-        try:
-            if self._is_fenced(op_id):
-                return
-            if isinstance(req, LoadProjectCatalogRequest):
-                value: Any = self._execute_catalog(req)
-            elif isinstance(req, LoadProjectSessionRequest):
-                value = self._execute_session(op_id, req)
-            else:
-                raise TypeError(f"Unsupported request: {type(req).__name__}")
-            if self._is_fenced(op_id):
-                return
-            self._safe_emit(IoCompleted(op_id=op_id, value=value))
-        except Exception as exc:
-            if not self._is_fenced(op_id):
-                self._safe_emit(IoFailed(op_id=op_id, error=exc))
-        finally:
-            with self._lock:
-                self._futures.pop(op_id, None)
-                self._in_flight.pop(op_id, None)
-                self._cancelled.discard(op_id)
+    def execute_op(self, op_id: OpId, req: IoRequest) -> Any:
+        if isinstance(req, LoadProjectCatalogRequest):
+            return self._execute_catalog(req)
+        if isinstance(req, LoadProjectSessionRequest):
+            return self._execute_session(op_id, req)
+        raise TypeError(f"Unsupported request: {type(req).__name__}")
 
     def _execute_catalog(self, req: LoadProjectCatalogRequest) -> ProjectCatalogResult:
         try:
@@ -949,7 +868,7 @@ class ProjectHistoryDriver(Driver):
         if isinstance(loaded, PendingSessionLoad):
             deadline = time.monotonic() + self._load_wait_timeout_s
             while isinstance(loaded, PendingSessionLoad):
-                if self._is_fenced(op_id):
+                if self.is_fenced(op_id):
                     raise RuntimeError("session history load cancelled")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1067,39 +986,24 @@ def _runtime(state: Any) -> ProjectMemoryRuntime:
     return rt
 
 
-def _context(state: Any) -> Mapping[str, Any]:
-    value = getattr(state, "_agent_zoo_context", None)
-    return value if isinstance(value, Mapping) else {}
-
-
 def _project_key(project_name: str, project_dir: Path) -> str:
     return f"{project_name}\x00{os.path.abspath(os.fspath(project_dir))}"
 
 
 def _history_runtime_context(state: Any) -> tuple[str, Path | None, str]:
-    context = _context(state)
+    ctx = session_context(state)
     smeta = session_state(state)
-    project_name = str(context.get("project_name") or smeta.project_name or "default")
-    current_session_id = str(smeta.session_id or context.get("session_id") or "")
-    project_dir_raw = str(context.get("project_dir") or "").strip()
-    if project_dir_raw:
-        project_dir = Path(project_dir_raw)
-    else:
-        index_raw = str(context.get("project_session_index") or "").strip()
-        if index_raw:
-            project_dir = Path(index_raw).parent.parent
-        else:
-            return project_name, None, current_session_id
-    return project_name, project_dir, current_session_id
+    project_name = str(ctx.project_name or smeta.project_name or "default")
+    current_session_id = str(smeta.session_id or ctx.session_id or "")
+    project_dir_raw = str(ctx.project_dir or "").strip()
+    if not project_dir_raw:
+        return project_name, None, current_session_id
+    return project_name, Path(project_dir_raw), current_session_id
 
 
 def _local_state_root(state: Any) -> str:
-    context = _context(state)
-    value = (
-        context.get("local_state_root")
-        or getattr(state, "_local_state_root", "")
-        or getattr(state, "local_state_root", "")
-    )
+    ctx = session_context(state)
+    value = ctx.local_state_root or getattr(state, "local_state_root", "")
     return str(value or "").strip()
 
 
@@ -1445,7 +1349,7 @@ class ProjectSessionBuffers:
     )
     init = {"buffer_manager": BufferManager}
     reads = {"buffer_manager"}
-    optional_reads = {"_agent_zoo_context", "_local_state_root"}
+    optional_reads: set[str] = set()
     writes = {"buffer_manager"}
 
     def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
@@ -1653,10 +1557,10 @@ _LIVE_HEALTH_FRESHNESS_S = 15.0
 
 
 def _live_store_root(state: Any) -> tuple[Path | None, str]:
-    context = _context(state)
-    raw = context.get("project_store_root")
+    ctx = session_context(state)
+    raw: Any = ctx.store_root
     if not raw:
-        project_dir = context.get("project_dir")
+        project_dir: Any = ctx.project_dir
         if not project_dir:
             return None, "missing-context; no project coordination store is attached"
         if not isinstance(project_dir, (str, os.PathLike)):
@@ -1712,9 +1616,9 @@ def _render_live_sessions_buffer(
 ) -> ReadonlyBufferView:
     """Pure top-level special-buffer renderer for ``live_sessions``."""
     rt = _runtime(state)
-    context = _context(state)
+    ctx = session_context(state)
     smeta = session_state(state)
-    project = str(context.get("project_name") or smeta.project_name or "(unknown)")
+    project = str(ctx.project_name or smeta.project_name or "(unknown)")
     root, context_error = _live_store_root(state)
     now = float(rt.live_clock())
     row_limit = rt.live_row_limit if row_limit_override is None else row_limit_override
@@ -1822,7 +1726,7 @@ def _render_live_sessions_buffer(
         )
     else:
         lines.append("History: disabled; no transcript links registered.")
-    current = str(smeta.session_id or context.get("session_id") or "")
+    current = str(smeta.session_id or ctx.session_id or "")
     for row, health in shown:
         has_obs = bool(row.observation_reason) or row.observed_at > 0.0
         age = f"{now - row.observed_at:.1f}s" if has_obs else "(unknown)"
@@ -1877,7 +1781,7 @@ class ProjectLiveSessionBuffer:
     )
     init = {"buffer_manager": BufferManager}
     reads = {"buffer_manager"}
-    optional_reads = {"_agent_zoo_context", "_local_state_root"}
+    optional_reads: set[str] = set()
     writes = {"buffer_manager"}
     BUFFER_ID = "live_sessions"
     IO_TAG = "project_memory_live_sessions"
@@ -1948,9 +1852,9 @@ class ProjectLiveSessionBuffer:
         *,
         hold_readiness: str | bool | None = None,
     ) -> None:
-        context = _context(state)
+        ctx = session_context(state)
         smeta = session_state(state)
-        project = str(context.get("project_name") or smeta.project_name or "(unknown)")
+        project = str(ctx.project_name or smeta.project_name or "(unknown)")
         root, _ = _live_store_root(state)
         if root is None:
             return
@@ -2170,7 +2074,7 @@ class ProjectMemorySystemPrompt(RenderTransformRegistrar):
 
     @staticmethod
     def _state_root() -> Path:
-        return resolve_state_root()
+        return PluginStorage(PLUGIN_NAME).state_root
 
 
 def _subfeature_enabled(section: Mapping[str, Any], name: str) -> bool:
@@ -2288,9 +2192,8 @@ def _settings(config: Any) -> list[Setting]:
     return settings
 
 
-def register_features(builder, *, session, config):
+def register_features(builder, *, config):
     """Register project history and live-session discovery in Agent Zoo pipelines."""
-    del session
     builder.add(Feature("project_memory_settings", components=_settings(config), order=[Setting]))
     section = ProjectMemorySystemPrompt.effective_section(config)
     if not ProjectMemorySystemPrompt.enabled(section.get("enabled", True)):

@@ -17,7 +17,7 @@ from agent_utils.core.state import State
 from agent_utils.features.buffers import BufferManager
 from agent_utils.features.core import IoFence
 from agent_utils.runtime.simulation import SimulationRuntime
-from agent_zoo.core.feature_state import session_state
+from agent_zoo.durability import session_context, session_state
 from agent_zoo.drivers.sessions import (
     AgentZooSessionDriver,
     SimSessionDriver,
@@ -209,21 +209,22 @@ def test_endpoint_sanitization(tmp_path, endpoint, expected):
 def test_authoritative_context_override_and_attached_store_roots(tmp_path):
     component, observer, now, requests, refresh, _ = opened(tmp_path)
     override = tmp_path / "override"
-    observer._agent_zoo_context["project_store_root"] = str(override)
-    observer._agent_zoo_context["local_state_root"] = str(tmp_path / "local-root")
+    ctx = session_context(observer)
+    ctx.store_root = str(override)
+    ctx.local_state_root = str(tmp_path / "local-root")
     refresh()
     assert requests[-1].store_root == str(override)
     assert requests[-1].local_state_root == str(tmp_path / "local-root")
     assert "Registry: empty" in component.render(observer).text
 
-    del observer._agent_zoo_context["project_store_root"]
+    ctx.store_root = ""
     other_project = tmp_path / "other-project"
-    observer._agent_zoo_context["project_dir"] = str(other_project)
+    ctx.project_dir = str(other_project)
     refresh()
     assert requests[-1].store_root == str(other_project / "coordination")
     assert "Registry: empty" in component.render(observer).text
 
-    observer._agent_zoo_context["project_store_root"] = "relative/path"
+    ctx.store_root = "relative/path"
     text = component.render(observer).text
     assert "must be absolute" in text
     assert not override.exists()
@@ -234,19 +235,24 @@ def test_missing_context_absent_empty_unavailable_and_unsupported_are_distinct(t
     component = pm.ProjectLiveSessionBuffer(clock=lambda: 100.0)
     observer = state(tmp_path / "project")
     observer._agent_zoo_context = {}
+    ctx = session_context(observer)
     component.handle(SessionReady(ts=100.0), observer, lambda _ev: None)
     assert observer.io.take_outbox() == []
     assert "Registry: missing-context" in component.render(observer).text
 
     # Real AgentZooSessionDriver never creates missing directories.
     missing = tmp_path / "missing"
-    observer._agent_zoo_context = dict(project_name="absent", project_dir=str(missing))
+    ctx.project_name = "absent"
+    ctx.project_dir = str(missing)
+    ctx.store_root = ""
     dispatch_via_driver(component, observer, RenderRequested(), AgentZooSessionDriver(), ts=100.0)
     assert not missing.exists()
     assert "Registry: empty (successful read; zero instances)" in component.render(observer).text
 
     # Driver-reported absent status is rendered distinctly.
-    observer._agent_zoo_context = dict(project_name="driver-absent", project_store_root=str(tmp_path / "gone"))
+    ctx.project_name = "driver-absent"
+    ctx.project_dir = ""
+    ctx.store_root = str(tmp_path / "gone")
     component.handle(RenderRequested(ts=100.0), observer, lambda _ev: None)
     eff = observer.io.take_outbox()[0]
     observer.io.complete(eff.op_id)
@@ -264,7 +270,8 @@ def test_missing_context_absent_empty_unavailable_and_unsupported_are_distinct(t
 
     # Existing empty store via real AgentZooSessionDriver.
     store = RecordStore(tmp_path / "empty")
-    observer._agent_zoo_context = dict(project_name="empty", project_store_root=str(store.root))
+    ctx.project_name = "empty"
+    ctx.store_root = str(store.root)
     dispatch_via_driver(component, observer, RenderRequested(), AgentZooSessionDriver(), ts=100.0)
     assert "Registry: empty (successful read; zero instances)" in component.render(observer).text
 
@@ -272,7 +279,8 @@ def test_missing_context_absent_empty_unavailable_and_unsupported_are_distinct(t
     malformed = tmp_path / "malformed"
     malformed.mkdir()
     (malformed / "format.json").write_text("{bad JSON")
-    observer._agent_zoo_context = dict(project_name="malformed", project_store_root=str(malformed))
+    ctx.project_name = "malformed"
+    ctx.store_root = str(malformed)
     dispatch_via_driver(component, observer, RenderRequested(), AgentZooSessionDriver(), ts=100.0)
     text = component.render(observer).text
     assert "Registry: unavailable" in text
@@ -452,7 +460,7 @@ def test_in_flight_limit_is_bounded_and_projects_do_not_share_snapshots(tmp_path
     observer = state(tmp_path / "project")
     for i in range(component.MAX_IN_FLIGHT + 1):
         root = tmp_path / f"store-{i}"
-        observer._agent_zoo_context["project_store_root"] = str(root)
+        session_context(observer).store_root = str(root)
         component.handle(RenderRequested(ts=100.0), observer, lambda _ev: None)
         text = component.render(observer).text
         assert "No successful registry snapshot" in text or "Registry: pending" in text

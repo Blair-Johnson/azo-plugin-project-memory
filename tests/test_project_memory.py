@@ -55,7 +55,7 @@ def test_explicit_config_overrides_installed_config(tmp_path, monkeypatch):
 def test_feature_contains_history_and_live_buffers(monkeypatch):
     monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
     features = []
-    pm.register_features(SimpleNamespace(add=features.append), session=None, config={})
+    pm.register_features(SimpleNamespace(add=features.append), config={})
 
     assert len(features) == 2
     assert features[0].name == "project_memory_settings"
@@ -69,7 +69,8 @@ def test_feature_contains_history_and_live_buffers(monkeypatch):
 
 
 def _install_only_project_memory(builder, *, session, config, **_kwargs):
-    pm.register_features(builder, session=session, config=config)
+    del session
+    pm.register_features(builder, config=config)
 
 
 @pytest.mark.parametrize(
@@ -137,7 +138,7 @@ def test_custom_prompt_respected_with_independent_features(
     if origin != "installed":
         section["system_prompt"] = expected
     features = []
-    pm.register_features(SimpleNamespace(add=features.append), session=None,
+    pm.register_features(SimpleNamespace(add=features.append),
                          config={"project_memory": section})
     prompt = next(component for component in features[-1].components
                   if isinstance(component, pm.ProjectMemorySystemPrompt))
@@ -150,7 +151,7 @@ def test_config_template_preserves_detailed_session_guidance(monkeypatch):
     template = Path(__file__).parents[1] / "config" / "project_memory.yaml"
     monkeypatch.setenv(pm.CONFIG_PATH_ENV, str(template))
     features = []
-    pm.register_features(SimpleNamespace(add=features.append), session=None, config={})
+    pm.register_features(SimpleNamespace(add=features.append), config={})
     prompt = next(component.text for component in features[-1].components
                   if isinstance(component, pm.ProjectMemorySystemPrompt))
     for guidance in (
@@ -177,7 +178,7 @@ def test_session_restored_holds_readiness_until_hydration_completes(tmp_path):
     project_dir.mkdir()
     session = Session()
     builder = PipelineBuilder().add(core_feature())
-    pm.register_features(builder, session=session, config={"project_memory": {"enabled": True}})
+    pm.register_features(builder, config={"project_memory": {"enabled": True}})
     session.pipeline = builder.build(suppress_warnings=True)
     session.ensure_initialized()
     session.state._agent_zoo_context = {

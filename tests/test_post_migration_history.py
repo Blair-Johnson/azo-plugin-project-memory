@@ -28,7 +28,7 @@ def test_independent_feature_toggles_match_installed_contract(
     features = []
     value = lambda enabled: {"enabled": enabled} if nested else enabled
     pm.register_features(
-        SimpleNamespace(add=features.append), session=None,
+        SimpleNamespace(add=features.append),
         config={"project_memory": {
             "project_sessions": value(sessions_enabled),
             "live_sessions": value(live_enabled),
@@ -61,7 +61,8 @@ def test_independent_feature_toggles_match_installed_contract(
 def test_current_pipeline_builds_history_only_without_memory_tools(builder, modes, monkeypatch):
     monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
     def install(builder, *, session, config, **kwargs):
-        pm.register_features(builder, session=session, config=config)
+        del session
+        pm.register_features(builder, config=config)
     monkeypatch.setattr(plugin_loader, "apply_pipeline_plugins", install)
     session = Session(system_prompt="test")
     pipeline = builder(
@@ -88,7 +89,8 @@ def test_current_pipeline_builds_history_only_without_memory_tools(builder, mode
 def test_pipeline_builds_live_registry_only(builder, modes, monkeypatch):
     monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
     def install(builder, *, session, config, **kwargs):
-        pm.register_features(builder, session=session, config=config)
+        del session
+        pm.register_features(builder, config=config)
     monkeypatch.setattr(plugin_loader, "apply_pipeline_plugins", install)
     session = Session(system_prompt="test")
     pipeline = builder(
@@ -109,7 +111,7 @@ def test_pipeline_builds_live_registry_only(builder, modes, monkeypatch):
 def test_master_disable_is_preserved(monkeypatch, enabled):
     monkeypatch.setattr(pm.ProjectMemorySystemPrompt, "_load_installed_config", lambda: {})
     features = []
-    pm.register_features(SimpleNamespace(add=features.append), session=None,
+    pm.register_features(SimpleNamespace(add=features.append),
                          config={"project_memory": {"enabled": enabled}})
     assert [feature.name for feature in features] == ["project_memory_settings"]
 
@@ -126,7 +128,7 @@ def test_legacy_memory_config_cannot_restore_tools_or_buffer(tmp_path, monkeypat
                         lambda: legacy if origin == "installed" else {})
     monkeypatch.setenv("AGENT_ZOO_LOCAL_STATE_ROOT", str(tmp_path / "local"))
     features = []
-    pm.register_features(SimpleNamespace(add=features.append), session=None,
+    pm.register_features(SimpleNamespace(add=features.append),
                          config=legacy if origin == "launch" else {})
 
     assert len(features) == 2

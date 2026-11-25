@@ -19,7 +19,7 @@ from agent_utils.features.buffers import BufferManager, buffer_editing_feature
 from agent_utils.features.core import core_feature
 from agent_utils.storage.repository import StoredState
 from agent_utils.storage.serialization import restore_session_document
-from agent_zoo.core.feature_state import session_state
+from agent_zoo.durability import session_context, session_state
 from agent_zoo.events import SessionReady
 from agent_zoo.storage import load as session_load, projects
 from agent_zoo.storage.load import LoadedSession, PendingSessionLoad, SessionLoader
@@ -186,7 +186,7 @@ def test_sans_io_audit_zero_partials_and_driver_contract(tmp_path):
 
     session = Session()
     builder = PipelineBuilder().add(core_feature()).add(buffer_editing_feature())
-    pm.register_features(builder, session=session, config={"project_memory": {"project_sessions": True}})
+    pm.register_features(builder, config={"project_memory": {"project_sessions": True}})
     session.pipeline = builder.build(suppress_warnings=True)
     session.ensure_initialized()
     session_state(session.state).session_id = CURRENT
@@ -487,7 +487,7 @@ def test_project_roots_isolate_identical_aliases(tmp_path, monkeypatch):
     first = load_view(component, observer, ALIAS, clock=lambda: now[0])
     other = tmp_path / "other-project"
     catalog(other, [row()])
-    observer._agent_zoo_context["project_dir"] = str(other)
+    session_context(observer).project_dir = str(other)
     component.handle(SessionReady(), observer, lambda _ev: None)
     pump_history_io(component, observer, clock=lambda: now[0])
     assert "Inventory: ready" in component.render_index(observer).text
@@ -525,7 +525,7 @@ def test_real_journal_registration_readonly_and_persistence_restore(tmp_path, fu
         session.state.buffer_manager = BufferManager()
         builder = PipelineBuilder().add(core_feature()).add(buffer_editing_feature())
         pm.register_features(
-            builder, session=session, config={"project_memory": {"project_sessions": True}}
+            builder, config={"project_memory": {"project_sessions": True}}
         )
         session.pipeline = builder.build(suppress_warnings=True)
         if document is not None:

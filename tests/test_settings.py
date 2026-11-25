@@ -29,7 +29,7 @@ def config_path(tmp_path, monkeypatch):
 def build_settings_session(config=None):
     session = Session()
     builder = PipelineBuilder().add(core_feature()).add(settings_feature())
-    pm.register_features(builder, session=session, config=config or {})
+    pm.register_features(builder, config=config or {})
     session.pipeline = builder.build(suppress_warnings=True)
     session.ensure_initialized()
     assert_pipeline_sans_io(session.pipeline)
@@ -116,7 +116,7 @@ def test_defaults_metadata_and_typed_persistence(config_path):
         "live_sessions": {"enabled": False},
     }
     features = []
-    pm.register_features(SimpleNamespace(add=features.append), session=None, config={})
+    pm.register_features(SimpleNamespace(add=features.append), config={})
     assert [feature.name for feature in features] == ["project_memory_settings"]
 
     fresh2 = build_settings_session()
@@ -127,7 +127,7 @@ def test_defaults_metadata_and_typed_persistence(config_path):
         fresh2, action="set", binding=r1["binding"], key="project_memory.project_sessions.enabled", value=True
     )
     assert r2["ok"]
-    pm.register_features(SimpleNamespace(add=features.append), session=None, config={})
+    pm.register_features(SimpleNamespace(add=features.append), config={})
     assert features[-1].name == "project_memory"
 
 

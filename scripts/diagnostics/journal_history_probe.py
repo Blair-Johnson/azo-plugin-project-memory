@@ -83,7 +83,7 @@ def main():
         session = Session(system_prompt="Private diagnostic; no provider calls.")
         session.state.buffer_manager = BufferManager()
         builder = PipelineBuilder().add(core_feature()).add(buffer_editing_feature())
-        pm.register_features(builder, session=session, config={"project_memory": {
+        pm.register_features(builder, config={"project_memory": {
             "enabled": enabled,
             "project_sessions": {"enabled": history},
             "live_sessions": {"enabled": live}}})
